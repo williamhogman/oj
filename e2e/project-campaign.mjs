@@ -102,6 +102,12 @@ try {
     '  console.error(\'Error: Could not resolve "missing-example-dependency"\');',
     "  process.exit(1);",
     "}",
+    'if (source.includes("EXACT_PUBLIC_MISSING")) {',
+    '  console.error(\'Error: Could not resolve "@vitejs/plugin-react-swc"\');',
+    '  console.error(\'Error: Could not resolve "@customer/private-package"\');',
+    '  console.error("at node_modules/@vitejs/plugin-react/dist/index.js");',
+    "  process.exit(1);",
+    "}",
     'if (source.includes("STRUCTURAL_ALPHA_ONE")) {',
     '  console.error(\'Error: circular graph recursion exceeded in "customer-one-private"\');',
     "  process.exit(1);",
@@ -242,6 +248,21 @@ try {
   assert.doesNotMatch(taxonomyResults,
     /customer-(?:alpha|beta|gamma|delta)-private|@secret\/|customerPrivateField|CUSTOMER_SOURCE|TAXONOMY_ALPHA|TAXONOMY_BETA|TAXONOMY_PRIVATE|never-persist|person@example|123e4567|\/private\//i,
     "diagnostic taxonomy must never persist customer paths, package names, source, secrets, contacts, or identifiers");
+
+  createArchive("exact-public-missing", false, "// EXACT_PUBLIC_MISSING\n");
+  const exactMissing = run();
+  assert.equal(exactMissing.status, 0, `exact missing dependency campaign failed:\n${exactMissing.stdout}\n${exactMissing.stderr}`);
+  const exactMissingCheck = readJournal().map((record) => record.checks.build)
+    .find((check) => check.publicMissingDependencies?.includes("@vitejs/plugin-react-swc"));
+  assert.ok(exactMissingCheck, "approved missing dependencies should remain actionable");
+  assert.deepEqual(exactMissingCheck.publicMissingDependencies, ["@vitejs/plugin-react-swc"],
+    "only approved packages reported as actually missing may survive");
+  assert.ok(exactMissingCheck.publicSymbols.includes("@vitejs/plugin-react"),
+    "package references in stack frames must remain distinct from actually missing dependencies");
+  const exactMissingResults = ["results.jsonl", "summary.json", "clusters.json"]
+    .map((filename) => fs.readFileSync(path.join(output, filename), "utf8")).join("\n");
+  assert.doesNotMatch(exactMissingResults, /@customer\/private-package|EXACT_PUBLIC_MISSING/,
+    "unapproved package names and project source must never be persisted");
 
   const baselineOnlyOutput = path.join(temporary, "baseline-only-results");
   const buildsBeforeBaselineOnly = fs.readFileSync(ojMarker, "utf8").trim().split("\n").length;

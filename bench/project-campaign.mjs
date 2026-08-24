@@ -248,6 +248,34 @@ const publicDiagnosticSymbols = [
   ["tailwindcss", /\btailwindcss\b/i],
 ];
 
+const publicMissingDependencyNames = new Set([
+  "@cloudflare/vite-plugin",
+  "@radix-ui/react-toast",
+  "@tailwindcss/typography",
+  "@tailwindcss/vite",
+  "@tanstack/query-core",
+  "@tanstack/react-query",
+  "@tanstack/react-router",
+  "@tanstack/react-start",
+  "@tanstack/router-generator",
+  "@tanstack/router-plugin",
+  "@vitejs/plugin-react",
+  "@vitejs/plugin-react-swc",
+  "autoprefixer",
+  "next-themes",
+  "nitro",
+  "postcss",
+  "react",
+  "react-dom",
+  "react-router-dom",
+  "rolldown",
+  "tailwindcss",
+  "tailwindcss-animate",
+  "tw-animate-css",
+  "vite",
+  "vite-tsconfig-paths",
+]);
+
 const publicDiagnosticFrames = [
   ["vite-plugin-bridge", /\bvite-plugin-bridge\.mjs\b/i],
   ["rolldown-assets", /\brolldown-assets\.mjs\b/i],
@@ -278,6 +306,9 @@ function publicDiagnosticTaxonomy(check, summary) {
   const errorClass = input.match(/\b(TypeError|ReferenceError|SyntaxError|RangeError|URIError|AggregateError|Error):/)?.[1];
   const markers = publicDiagnosticMarkers.filter(([, expression]) => expression.test(input)).map(([marker]) => marker);
   const publicSymbols = publicDiagnosticSymbols.filter(([, expression]) => expression.test(input)).map(([symbol]) => symbol);
+  const publicMissingDependencies = Array.isArray(check.diagnostic?.dependencies)
+    ? [...new Set(check.diagnostic.dependencies.filter((name) => publicMissingDependencyNames.has(name)))].sort()
+    : [];
   const internalFrames = publicDiagnosticFrames.filter(([, expression]) => expression.test(input)).map(([frame]) => frame);
   const candidateProperty = input.match(/Cannot read propert(?:y|ies) of (?:undefined|null)\s*\(reading ['"]([\w$]+)['"]\)/i)?.[1];
   const nullishProperty = publicNullishProperties.has(candidateProperty) ? candidateProperty : undefined;
@@ -285,6 +316,7 @@ function publicDiagnosticTaxonomy(check, summary) {
     ...(errorClass ? { errorClass } : {}),
     ...(markers.length ? { markers } : {}),
     ...(publicSymbols.length ? { publicSymbols } : {}),
+    ...(publicMissingDependencies.length ? { publicMissingDependencies } : {}),
     ...(internalFrames.length ? { internalFrames } : {}),
     ...(nullishProperty ? { nullishProperty } : {}),
   };
