@@ -291,7 +291,7 @@ function runBuild(project, directory, options) {
 }
 
 function runBaseline(directory, options) {
-  return runCommand("npx", ["--no-install", "vite", "build", "--outDir", path.join(directory, ".vite-dist")], {
+  return runCommand(path.join(directory, "node_modules", ".bin", "vite"), ["build", "--outDir", path.join(directory, ".vite-dist")], {
     cwd: directory,
     timeout: options.timeoutMs,
   });

@@ -44,6 +44,53 @@ try {
   assert.equal(report.projects[0].kind, "html-vite");
   assert.ok(fs.existsSync(path.join(output, "projects", "project", "build.log")));
 
+  const baselineExecutables = path.join(temporary, "baseline-executables");
+  const baselineInvocation = path.join(temporary, "baseline-invocation.json");
+  const packageRunnerInvocation = path.join(temporary, "package-runner-invocation");
+  const baselineOutput = path.join(temporary, "baseline-results");
+  const baselineWorkdir = path.join(temporary, "baseline-workdir");
+  fs.mkdirSync(baselineExecutables);
+  fs.mkdirSync(path.join(layer, ".bin"));
+  fs.writeFileSync(path.join(layer, ".bin", "vite"), [
+    "#!/usr/bin/env node",
+    'const fs = require("node:fs");',
+    "fs.writeFileSync(process.env.PROJECT_AGENT_BASELINE_INVOCATION,",
+    "  JSON.stringify({ arguments: process.argv.slice(2), directory: process.cwd() }));",
+  ].join("\n") + "\n", { mode: 0o755 });
+  fs.writeFileSync(path.join(baselineExecutables, "npx"), [
+    "#!/usr/bin/env node",
+    'require("node:fs").writeFileSync(process.env.PROJECT_AGENT_PACKAGE_RUNNER_INVOCATION, "invoked");',
+    "process.exit(79);",
+  ].join("\n") + "\n", { mode: 0o755 });
+
+  const baseline = spawnSync(process.execPath, [
+    path.join(root, "bench", "project-agent.mjs"),
+    "--project", archive,
+    "--dependency-layer", layer,
+    "--mode", "build",
+    "--baseline-only",
+    "--workdir", baselineWorkdir,
+    "--output-dir", baselineOutput,
+  ], {
+    cwd: root,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      PATH: `${baselineExecutables}${path.delimiter}${process.env.PATH}`,
+      PROJECT_AGENT_BASELINE_INVOCATION: baselineInvocation,
+      PROJECT_AGENT_PACKAGE_RUNNER_INVOCATION: packageRunnerInvocation,
+    },
+  });
+  assert.equal(baseline.status, 0, `direct Vite baseline failed:\n${baseline.stdout}\n${baseline.stderr}`);
+  assert.equal(fs.existsSync(packageRunnerInvocation), false, "production baselines must never invoke npx");
+  const stagedProject = path.join(baselineWorkdir, "project", "sample-project");
+  assert.deepEqual(JSON.parse(fs.readFileSync(baselineInvocation, "utf8")), {
+    arguments: ["build", "--outDir", path.join(stagedProject, ".vite-dist")],
+    directory: fs.realpathSync(stagedProject),
+  }, "production baselines must invoke the staged project's local Vite executable");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(baselineOutput, "report.json"), "utf8"))
+    .projects[0].checks.baseline.ok, true);
+
   const missingArchive = path.join(temporary, "missing-dependency.zip");
   const missingOutput = path.join(temporary, "missing-results");
   fs.writeFileSync(path.join(project, "main.js"), 'import "missing-agent-dependency";\n');
