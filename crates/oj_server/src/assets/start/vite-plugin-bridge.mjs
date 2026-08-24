@@ -113,7 +113,7 @@ export function createPluginContainer(vite, allPlugins, {
 } = {}) {
   const plugins = ordered(
     allPlugins.filter(
-      (p) => (p.resolveId || p.load || p.transform || p.generateBundle) && applyMatches(p, command, mode),
+      (p) => (p.buildStart || p.resolveId || p.load || p.transform || p.generateBundle) && applyMatches(p, command, mode),
     ),
   );
 
