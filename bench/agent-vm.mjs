@@ -286,10 +286,24 @@ function restoreNetwork() {
 
 function scrub() {
   assertIsolated();
+  const patterns = [
+    "oj-corpus-*",
+    "oj-project-agent-*",
+    "oj-project-jail-*",
+    "oj-project-input-*",
+    "oj-campaign-worker-*",
+  ];
+  const matches = patterns.map((pattern) => `-name ${quote(pattern)}`).join(" -o ");
   remote([
     "set -euo pipefail",
-    `rm -rf ${quote(`${options.guestRepo}/.agent-inputs`)}`,
-    "find /tmp -maxdepth 1 -type d -name 'oj-project-agent-*' -exec rm -rf {} +",
+    `sudo rm -rf -- ${quote(`${options.guestRepo}/.agent-inputs`)}`,
+    "for directory in /tmp /var/tmp; do",
+    `  sudo find "$directory" -mindepth 1 -maxdepth 1 \\( ${matches} \\) -exec rm -rf -- {} +`,
+    `  if sudo find "$directory" -mindepth 1 -maxdepth 1 \\( ${matches} \\) -print -quit | grep -q .; then`,
+    "    echo 'private project artifacts remain in the VM' >&2",
+    "    exit 1",
+    "  fi",
+    "done",
     "echo 'Private project archives and staged workspaces removed.'",
   ].join("\n"));
 }

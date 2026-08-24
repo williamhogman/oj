@@ -13,6 +13,9 @@ const binaries = path.join(temporary, "bin");
 const marker = path.join(temporary, "resolver-paused");
 const resolver = path.join(temporary, "resolver-state");
 const log = path.join(temporary, "commands.log");
+const guestTemporary = path.join(temporary, "guest-tmp");
+const guestVariableTemporary = path.join(temporary, "guest-var-tmp");
+const artifactPrefixes = ["oj-corpus", "oj-project-agent", "oj-project-jail", "oj-project-input", "oj-campaign-worker"];
 
 function executable(name, source) {
   fs.writeFileSync(path.join(binaries, name), source, { mode: 0o755 });
@@ -28,6 +31,8 @@ function invoke(action, environment = {}) {
       OJ_TEST_LOG: log,
       OJ_TEST_MARKER: marker,
       OJ_TEST_RESOLVER_STATE: resolver,
+      OJ_TEST_GUEST_TEMPORARY: guestTemporary,
+      OJ_TEST_GUEST_VARIABLE_TEMPORARY: guestVariableTemporary,
       ...environment,
     },
   });
@@ -57,11 +62,26 @@ const result = spawnSync("/bin/bash", ["-c", script], { stdio: "inherit", env: p
 process.exit(result.status ?? 1);
 `);
 
-  executable("sudo", "#!/bin/sh\nexec \"$@\"\n");
+  executable("sudo", "#!/bin/sh\nif [ \"$1\" = -n ]; then shift; fi\nexec \"$@\"\n");
   executable("hostname", "#!/bin/sh\nprintf '%s\\n' localhost\n");
   executable("findmnt", "#!/bin/sh\nexit 1\n");
   executable("curl", "#!/bin/sh\nexit 1\n");
-  executable("find", "#!/bin/sh\nif [ \"${OJ_TEST_ARCHIVES:-0}\" = 1 ]; then printf '%s\\n' staged.zip; fi\n");
+  executable("find", `#!${process.execPath}
+const fs = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.OJ_TEST_LOG, "find " + args.join(" ") + "\\n");
+if (process.env.OJ_TEST_REAL_FIND !== "1") {
+  if (process.env.OJ_TEST_ARCHIVES === "1") console.log("staged.zip");
+  process.exit(0);
+}
+if (process.env.OJ_TEST_FIND_FAIL === "1") process.exit(93);
+if (process.env.OJ_TEST_PRESERVE_ARTIFACT === "1" && args.includes("-exec")) process.exit(0);
+if (args[0] === "/tmp") args[0] = process.env.OJ_TEST_GUEST_TEMPORARY;
+if (args[0] === "/var/tmp") args[0] = process.env.OJ_TEST_GUEST_VARIABLE_TEMPORARY;
+const result = spawnSync("/usr/bin/find", args, { stdio: "inherit", env: process.env });
+process.exit(result.status ?? 1);
+`);
 
   for (const firewall of ["iptables", "ip6tables"]) {
     executable(firewall, `#!/bin/sh\nprintf '%s %s\\n' '${firewall}' "$*" >> "$OJ_TEST_LOG"\nexit 0\n`);
@@ -171,6 +191,47 @@ process.exit(92);
     "resolver restoration must not begin before customer archives are scrubbed");
   assert.ok(!commands().some((entry) => entry.startsWith("iptables -D") || entry.startsWith("ip6tables -D")),
     "both firewalls must stay enabled while customer archives remain");
+
+  reset();
+  for (const directory of [guestTemporary, guestVariableTemporary]) {
+    fs.mkdirSync(directory);
+    for (const prefix of artifactPrefixes) {
+      const artifact = path.join(directory, `${prefix}-synthetic`);
+      fs.mkdirSync(artifact);
+      fs.writeFileSync(path.join(artifact, "customer.zip"), "synthetic customer artifact");
+    }
+    fs.mkdirSync(path.join(directory, "oj-unrelated-preserved"));
+    fs.writeFileSync(path.join(directory, "oj-unrelated-preserved", "oj-corpus-nested"), "preserved");
+  }
+  const guestInputs = path.join(temporary, "oj-project-agent", ".agent-inputs");
+  fs.mkdirSync(guestInputs, { recursive: true });
+  fs.writeFileSync(path.join(guestInputs, "customer.zip"), "synthetic customer artifact");
+
+  const scrubbed = invoke("scrub", { OJ_TEST_REAL_FIND: "1" });
+  assert.equal(scrubbed.status, 0, `secure project cleanup failed:\n${scrubbed.stdout}\n${scrubbed.stderr}`);
+  assert.ok(!fs.existsSync(guestInputs), "staged guest archives must be removed");
+  for (const directory of [guestTemporary, guestVariableTemporary]) {
+    for (const prefix of artifactPrefixes) {
+      assert.ok(!fs.existsSync(path.join(directory, `${prefix}-synthetic`)),
+        `all ${prefix} artifacts must be removed from ${path.basename(directory)}`);
+    }
+    assert.ok(fs.existsSync(path.join(directory, "oj-unrelated-preserved", "oj-corpus-nested")),
+      "cleanup must not traverse or remove unrelated temporary directories");
+  }
+  const cleanup = commands();
+  assert.ok(cleanup.some((entry) => entry.startsWith("iptables -C OUTPUT -j OJ_AGENT_EGRESS")));
+  assert.ok(cleanup.some((entry) => entry.startsWith("ip6tables -C OUTPUT -j OJ_AGENT_EGRESS")));
+  assert.ok(!cleanup.some((entry) => entry.startsWith("iptables -D") || entry.startsWith("ip6tables -D")),
+    "artifact cleanup must never reopen either network firewall");
+
+  const retained = path.join(guestVariableTemporary, "oj-project-jail-retained");
+  fs.mkdirSync(retained);
+  const incomplete = invoke("scrub", { OJ_TEST_REAL_FIND: "1", OJ_TEST_PRESERVE_ARTIFACT: "1" });
+  assert.notEqual(incomplete.status, 0, "cleanup must fail closed when any customer artifact remains");
+  assert.ok(fs.existsSync(retained), "the synthetic retained artifact must exercise verification");
+
+  const failedFind = invoke("scrub", { OJ_TEST_REAL_FIND: "1", OJ_TEST_FIND_FAIL: "1" });
+  assert.notEqual(failedFind.status, 0, "cleanup must fail closed when temporary-root inspection fails");
 
   console.log("AGENT-VM E2E PASSED");
 } finally {
