@@ -2,7 +2,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -108,4 +108,72 @@ test("hookHandler / hookFilter: function form and object form", () => {
 
   assert.equal(hookHandler(undefined), null);
   assert.equal(hookHandler({ handler: "not-a-fn" }), null);
+});
+
+test("generateBundle honors environment consumer gates", async () => {
+  const emitted = [];
+  const plugin = {
+    name: "synthetic-server-manifest",
+    applyToEnvironment: (environment) => environment.config.consumer === "server",
+    generateBundle() {
+      this.emitFile({ type: "asset", fileName: "server-manifest.json", source: "{}" });
+    },
+  };
+
+  await createPluginContainer({}, [plugin], { environment: "client" })
+    .generateBundle((asset) => emitted.push(asset));
+  assert.deepEqual(emitted, []);
+
+  await createPluginContainer({}, [plugin], { environment: "ssr" })
+    .generateBundle((asset) => emitted.push(asset));
+  assert.equal(emitted.length, 1);
+  assert.equal(emitted[0].fileName, "server-manifest.json");
+});
+
+test("buildStart runs plugins whose only hook initializes generated sources", async () => {
+  let initialized = 0;
+  const container = createPluginContainer({}, [{
+    name: "synthetic-source-generator",
+    buildStart() { initialized++; },
+  }]);
+
+  await container.buildStart();
+  await container.buildStart();
+
+  assert.equal(initialized, 1);
+});
+
+test("plugin hooks receive the configured Vite mode", async () => {
+  const plugin = {
+    name: "synthetic-mode-transform",
+    transform() { return `export default ${JSON.stringify(this.environment.config.mode)};`; },
+  };
+
+  const staging = createPluginContainer({}, [plugin], { command: "serve", mode: "staging" });
+  const preview = createPluginContainer({}, [plugin], { command: "build", mode: "preview" });
+  const defaults = createPluginContainer({}, [plugin], { command: "build" });
+
+  assert.equal(await staging.transform("", "/app.ts"), 'export default "staging";');
+  assert.equal(await preview.transform("", "/app.ts"), 'export default "preview";');
+  assert.equal(await defaults.transform("", "/app.ts"), 'export default "production";');
+});
+
+test("resolveId and load receive Vite SSR hook options", async () => {
+  const plugin = {
+    name: "synthetic-environment-module",
+    resolveId(source, _importer, options) {
+      return `\0${options?.ssr ? "server" : "client"}:${source}`;
+    },
+    load(_id, options) {
+      return `export default ${JSON.stringify(options?.ssr ? "server" : "client")};`;
+    },
+  };
+
+  const server = createPluginContainer({}, [plugin], { environment: "ssr" });
+  const client = createPluginContainer({}, [plugin], { environment: "client" });
+
+  assert.equal(await server.resolveId("virtual:entry", "/app.ts"), "\0server:virtual:entry");
+  assert.equal(await server.load("\0server:virtual:entry"), 'export default "server";');
+  assert.equal(await client.resolveId("virtual:entry", "/app.ts"), "\0client:virtual:entry");
+  assert.equal(await client.load("\0client:virtual:entry"), 'export default "client";');
 });

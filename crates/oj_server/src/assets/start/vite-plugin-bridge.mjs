@@ -105,10 +105,10 @@ export function findConfig(app) {
   return null;
 }
 
-export function createPluginContainer(vite, allPlugins, { command = "serve", mode = "development", environment = "client" } = {}) {
+export function createPluginContainer(vite, allPlugins, { command = "serve", mode = command === "build" ? "production" : "development", environment = "client" } = {}) {
   const plugins = ordered(
     allPlugins.filter(
-      (p) => (p.resolveId || p.load || p.transform || p.generateBundle) && applyMatches(p, command, mode),
+      (p) => (p.buildStart || p.resolveId || p.load || p.transform || p.generateBundle) && applyMatches(p, command, mode),
     ),
   );
 
@@ -128,7 +128,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
     environment: {
       name: environment,
       mode: command === "build" ? "build" : "dev",
-      config: { command, consumer, mode: command === "build" ? "production" : "development" },
+      config: { command, consumer, mode },
     },
     meta: { rollupVersion: "4.0.0", watchMode: command !== "build", framework: "oj" },
     warn() {}, info() {}, debug() {},
@@ -147,7 +147,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       const h = hookHandler(p.resolveId);
       if (!h || !idAllowed(hookFilter(p.resolveId), id)) continue;
       let r;
-      try { r = await h.call(ctx, id, importer, { isEntry: false }); } catch { continue; }
+      try { r = await h.call(ctx, id, importer, { isEntry: false, ssr: environment === "ssr" }); } catch { continue; }
       if (r != null) return typeof r === "string" ? r : r.id;
     }
     return null;
@@ -159,7 +159,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
       const h = hookHandler(p.load);
       if (!h || !idAllowed(hookFilter(p.load), id)) continue;
       let r;
-      try { r = await h.call(ctx, id); } catch { continue; }
+      try { r = await h.call(ctx, id, { ssr: environment === "ssr" }); } catch { continue; }
       if (r != null) return typeof r === "string" ? r : r.code;
     }
     return null;
@@ -198,13 +198,7 @@ export function createPluginContainer(vite, allPlugins, { command = "serve", mod
     const genCtx = { ...ctx, emitFile: (f) => (emit(f), "oj-emit-ref") };
     for (const p of plugins) {
       const h = hookHandler(p.generateBundle);
-      if (!h) continue;
-      const ae = p.applyToEnvironment;
-      if (typeof ae === "function") {
-        let ok;
-        try { ok = ae({ name: environment }); } catch { ok = true; }
-        if (ok === false) continue;
-      }
+      if (!h || !envAllows(p, environment)) continue;
       try { await h.call(genCtx, { format: "es" }, {}, false); } catch {}
     }
   }
