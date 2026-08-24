@@ -108,7 +108,7 @@ export function findConfig(app) {
 export function createPluginContainer(vite, allPlugins, { command = "serve", mode = command === "build" ? "production" : "development", environment = "client" } = {}) {
   const plugins = ordered(
     allPlugins.filter(
-      (p) => (p.buildStart || p.resolveId || p.load || p.transform || p.generateBundle) && applyMatches(p, command, mode),
+      (p) => (p.resolveId || p.load || p.transform || p.generateBundle) && applyMatches(p, command, mode),
     ),
   );
 
