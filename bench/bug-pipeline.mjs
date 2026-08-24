@@ -31,21 +31,27 @@ Actions:
   release    Return a claimed task to the pending queue
   verify     Verify a regression fails before its fix and passes afterward
   complete   Verify a claimed task and mark it complete
+  publish    Publish one verified regression and fix as an individual pull request
 
 Options:
   --state PATH           Durable JSON queue state
   --input PATH           Generic cluster report for ingest
   --repo PATH            Git checkout (default: current directory)
   --worktrees PATH       Worktree directory (default: system temporary directory)
-  --base REF             Starting Git revision (default: HEAD)
+  --base REF             Starting Git revision (default: HEAD; main for publish)
   --worker NAME          Claiming worker identifier
-  --id ID                Task identifier for release, verify, or complete
+  --id ID                Task identifier for release, verify, complete, or publish
   --test-commit SHA      Test-only commit containing the failing regression
   --fix-commit SHA       Later commit fixing the unchanged regression
   --test-command TEXT    Regression command, without shell operators
+  --github-repo NAME     Pull request target in OWNER/REPOSITORY format
+  --push-remote NAME     Git remote receiving bug branches (default: origin)
+  --upstream-remote NAME Git remote supplying the pull request base (default: upstream)
+  --head-owner NAME      GitHub account owning the push remote
   --report PATH          Write an independent verification report
   --deny TEXT            Reject public artifacts containing this text; repeatable
   --timeout-ms NUMBER    Regression timeout (default: 120000)
+  --draft                Create a draft pull request
   --dry-run              Preview actions without changing durable state`;
 }
 
@@ -55,7 +61,7 @@ function parseArguments(argv) {
     process.stdout.write(`${usage()}\n`);
     process.exit(0);
   }
-  if (!["ingest", "list", "claim", "release", "verify", "complete"].includes(action)) {
+  if (!["ingest", "list", "claim", "release", "verify", "complete", "publish"].includes(action)) {
     throw new Error(`unknown action: ${action}`);
   }
 
@@ -63,16 +69,23 @@ function parseArguments(argv) {
     action,
     repo: process.cwd(),
     worktrees: path.join(os.tmpdir(), "project-bug-worktrees"),
-    base: "HEAD",
+    base: action === "publish" ? "main" : "HEAD",
+    pushRemote: "origin",
+    upstreamRemote: "upstream",
     deny: [],
     timeoutMs: 120_000,
     dryRun: false,
+    draft: false,
   };
 
   for (let index = 0; index < arguments_.length; index += 1) {
     const flag = arguments_[index];
     if (flag === "--dry-run") {
       options.dryRun = true;
+      continue;
+    }
+    if (flag === "--draft") {
+      options.draft = true;
       continue;
     }
     if (flag === "--help") {
@@ -92,6 +105,10 @@ function parseArguments(argv) {
       case "--test-commit": options.testCommit = value; break;
       case "--fix-commit": options.fixCommit = value; break;
       case "--test-command": options.testCommand = value; break;
+      case "--github-repo": options.githubRepo = value; break;
+      case "--push-remote": options.pushRemote = value; break;
+      case "--upstream-remote": options.upstreamRemote = value; break;
+      case "--head-owner": options.headOwner = value; break;
       case "--report": options.report = path.resolve(value); break;
       case "--deny": options.deny.push(value); break;
       case "--timeout-ms": options.timeoutMs = Number(value); break;
@@ -103,10 +120,19 @@ function parseArguments(argv) {
   if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1) {
     throw new Error("--timeout-ms must be a positive integer");
   }
-  for (const [flag, value] of [["--id", options.id], ["--worker", options.worker]]) {
+  for (const [flag, value] of [
+    ["--id", options.id],
+    ["--worker", options.worker],
+    ["--push-remote", options.pushRemote],
+    ["--upstream-remote", options.upstreamRemote],
+    ["--head-owner", options.headOwner],
+  ]) {
     if (value && !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/.test(value)) {
       throw new Error(`${flag} must be a simple identifier`);
     }
+  }
+  if (options.githubRepo && !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}\/[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$/.test(options.githubRepo)) {
+    throw new Error("--github-repo must use OWNER/REPOSITORY format");
   }
   return options;
 }
@@ -517,11 +543,162 @@ function complete(options) {
       task.status = "completed";
       task.testCommit = report.testCommit;
       task.fixCommit = report.fixCommit;
+      task.testCommand = options.testCommand;
+      task.verification = {
+        failingExitCode: report.failingRegression.exitCode,
+        passingExitCode: report.passingRegression.exitCode,
+        verifiedAt: report.verifiedAt,
+      };
       task.completedAt = report.verifiedAt;
       writeReport(options, report);
     }
     return { action: "complete", dryRun: options.dryRun, task, report };
   });
+}
+
+function resolvePublicationBase(options) {
+  const valid = git(options.repo, ["check-ref-format", `refs/heads/${options.base}`], { allowFailure: true });
+  if (valid.status !== 0) throw new Error("--base must be a valid target branch name for publish");
+  for (const candidate of [
+    `refs/remotes/${options.upstreamRemote}/${options.base}`,
+    `refs/heads/${options.base}`,
+  ]) {
+    const resolved = git(options.repo, ["rev-parse", "--verify", `${candidate}^{commit}`], { allowFailure: true });
+    if (resolved.status === 0) return resolved.stdout.trim();
+  }
+  throw new Error(`cannot resolve target branch ${options.base}; fetch ${options.upstreamRemote} first`);
+}
+
+function resolveHeadOwner(options) {
+  if (options.headOwner) return options.headOwner;
+  const remote = git(options.repo, ["remote", "get-url", options.pushRemote]).stdout.trim();
+  const match = remote.match(/^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([a-zA-Z0-9_-]+)\/[a-zA-Z0-9._-]+(?:\.git)?\/?$/);
+  if (!match) throw new Error("cannot infer GitHub fork owner; provide --head-owner");
+  return match[1];
+}
+
+function pullRequestText(task, command, report) {
+  const title = `fix(${task.stage}): handle ${task.kind} compatibility failure`;
+  const body = [
+    "## Summary",
+    "",
+    `- Correct a ${task.kind} failure during ${task.stage}.`,
+    "- Add an independent synthetic regression in a separate preceding commit.",
+    "",
+    "## Verification",
+    "",
+    `- Regression command: \`${command}\`.`,
+    `- Before the fix: fails with exit code ${report.failingRegression.exitCode}.`,
+    `- After the fix: passes with exit code ${report.passingRegression.exitCode}.`,
+  ].join("\n");
+  return { title, body };
+}
+
+function createPullRequest(options, branch, headOwner, title, body) {
+  const arguments_ = [
+    "pr", "create",
+    "--repo", options.githubRepo,
+    "--head", `${headOwner}:${branch}`,
+    "--base", options.base,
+    "--title", title,
+    "--body", body,
+  ];
+  if (options.draft) arguments_.push("--draft");
+  const result = spawnSync("gh", arguments_, {
+    cwd: options.repo,
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024,
+  });
+  if (result.error) throw new Error(`pull request creation failed: ${result.error.message}`);
+  if (result.status !== 0) {
+    throw new Error(`pull request creation failed: ${result.stderr.trim().split("\n")[0] || "command failed"}`);
+  }
+  const url = result.stdout.trim().split("\n").at(-1);
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error("pull request creation did not return a GitHub pull request URL");
+  }
+  if (parsed.protocol !== "https:" || parsed.hostname !== "github.com"
+    || !new RegExp(`^/${options.githubRepo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/pull/[0-9]+/?$`, "i").test(parsed.pathname)) {
+    throw new Error("pull request creation returned an unexpected repository URL");
+  }
+  return url;
+}
+
+function publish(options) {
+  if (!options.githubRepo) throw new Error("--github-repo is required for publish");
+  const snapshot = requireTask(readState(options.state), options.id, "completed");
+  if (snapshot.pullRequest) {
+    return { action: "publish", dryRun: options.dryRun, alreadyPublished: true, task: snapshot, pullRequest: snapshot.pullRequest };
+  }
+  const command = options.testCommand ?? snapshot.testCommand;
+  if (!command) throw new Error("--test-command is required for completed tasks without a recorded regression command");
+  const baseCommit = resolvePublicationBase(options);
+  const headOwner = resolveHeadOwner(options);
+  const branch = `bugfix/${snapshot.id}`;
+  const initialOptions = {
+    ...options,
+    dryRun: true,
+    testCommit: snapshot.testCommit,
+    fixCommit: snapshot.fixCommit,
+    testCommand: command,
+  };
+  verifyTask(initialOptions, snapshot);
+  const planned = { branch, base: options.base, baseCommit, repository: options.githubRepo, head: `${headOwner}:${branch}` };
+  if (options.dryRun) return { action: "publish", dryRun: true, task: snapshot, pullRequest: planned };
+
+  const publicationRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bug-pipeline-publish-"));
+  const checkout = path.join(publicationRoot, "checkout");
+  let created = false;
+  let pushed = false;
+  let pullRequest;
+  try {
+    git(options.repo, ["worktree", "add", "-b", branch, checkout, baseCommit]);
+    created = true;
+    git(checkout, ["cherry-pick", snapshot.testCommit]);
+    const testCommit = resolveCommit(checkout, "HEAD", "publication regression commit");
+    git(checkout, ["cherry-pick", `${snapshot.testCommit}..${snapshot.fixCommit}`]);
+    const fixCommit = resolveCommit(checkout, "HEAD", "publication fix commit");
+    const task = { ...snapshot, branch, baseCommit };
+    const report = verifyTask({
+      ...options,
+      repo: checkout,
+      testCommit,
+      fixCommit,
+      testCommand: command,
+    }, task);
+    const { title, body } = pullRequestText(snapshot, command, report);
+    assertPrivateSafe(title, options.deny, "pull request title");
+    assertPrivateSafe(body, options.deny, "pull request body");
+    git(checkout, ["push", options.pushRemote, `${branch}:refs/heads/${branch}`]);
+    pushed = true;
+    const url = createPullRequest(options, branch, headOwner, title, body);
+    pullRequest = {
+      ...planned,
+      testCommit,
+      fixCommit,
+      title,
+      url,
+      publishedAt: new Date().toISOString(),
+    };
+    return withStateLock(options, (state) => {
+      const current = requireTask(state, snapshot.id, "completed");
+      if (current.testCommit !== snapshot.testCommit || current.fixCommit !== snapshot.fixCommit) {
+        throw new Error("completed task changed while publishing its pull request");
+      }
+      current.pullRequest = pullRequest;
+      writeReport(options, report);
+      return { action: "publish", dryRun: false, alreadyPublished: false, task: current, report, pullRequest };
+    });
+  } finally {
+    if (created) {
+      git(options.repo, ["worktree", "remove", "--force", checkout], { allowFailure: true });
+      if (!pushed) git(options.repo, ["branch", "-D", branch], { allowFailure: true });
+    }
+    fs.rmSync(publicationRoot, { recursive: true, force: true });
+  }
 }
 
 function main() {
@@ -541,6 +718,7 @@ function main() {
     release,
     verify,
     complete,
+    publish,
   };
   const result = handlers[options.action](options);
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
