@@ -172,6 +172,10 @@ pub struct ViteValues {
 }
 
 pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
+    extract_vite_values_with(root, "serve", "development")
+}
+
+pub fn extract_vite_values_with(root: &Path, command: &str, mode: &str) -> Option<ViteValues> {
     if plugins_file(root).is_some() {
         return None;
     }
@@ -184,7 +188,7 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
             blake3::hash(VITE_EXTRACT_JS.as_bytes()).to_hex()
         ),
     );
-    if let Some(hit) = store.lookup(&vite, "serve", "development") {
+    if let Some(hit) = store.lookup(&vite, command, mode) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&hit.output) {
             if !hit.stderr.is_empty() {
                 eprint!("{}", hit.stderr);
@@ -201,8 +205,8 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
         .arg(&script)
         .arg(&vite)
         .arg(root)
-        .arg("serve")
-        .arg("development")
+        .arg(command)
+        .arg(mode)
         .env("OJ_CACHE_ROOT", oj_cache::cache_root(root))
         .env("NODE_COMPILE_CACHE", crate::node_compile_cache(root))
         .current_dir(root)
@@ -213,25 +217,27 @@ pub fn extract_vite_values(root: &Path) -> Option<ViteValues> {
         eprint!("{stderr}");
     }
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    if json.get("__ok").and_then(|v| v.as_bool()) == Some(true) {
-        let deps: Vec<PathBuf> = json
-            .get("__deps")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|d| d.as_str().map(PathBuf::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        store.store(
-            &vite,
-            "serve",
-            "development",
-            &deps,
-            &String::from_utf8_lossy(&out.stdout),
-            &stderr,
-        );
+    if json.get("__ok").and_then(|value| value.as_bool()) != Some(true) {
+        return None;
     }
+    let deps: Vec<PathBuf> = json
+        .get("__deps")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|dependency| dependency.as_str().map(PathBuf::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    store.store(
+        &vite,
+        command,
+        mode,
+        &deps,
+        &String::from_utf8_lossy(&out.stdout),
+        &stderr,
+    );
     crate::boot_phase("vite-extract cache miss (subprocess ran)");
     Some(parse_vite_values(&json))
 }
@@ -273,11 +279,29 @@ fn parse_vite_values(json: &serde_json::Value) -> ViteValues {
 }
 
 #[inline]
-pub fn adopt_vite_config_values(config: &mut oj_config::OjConfig, root: &Path) {
-    let Some(v) = extract_vite_values(root) else {
-        return;
+pub fn adopt_vite_config_values(
+    config: &mut oj_config::OjConfig,
+    root: &Path,
+) -> Result<(), String> {
+    adopt_vite_config_values_with(config, root, "serve", "development")
+}
+
+pub fn adopt_vite_config_values_with(
+    config: &mut oj_config::OjConfig,
+    root: &Path,
+    command: &str,
+    mode: &str,
+) -> Result<(), String> {
+    let Some(v) = extract_vite_values_with(root, command, mode) else {
+        if plugins_file(root).is_none() {
+            if let Some(path) = vite_config_file(root) {
+                return Err(format!("failed to load Vite config: {}", path.display()));
+            }
+        }
+        return Ok(());
     };
     merge_vite_values(config, v);
+    Ok(())
 }
 
 fn merge_vite_values(config: &mut oj_config::OjConfig, v: ViteValues) {
