@@ -242,6 +242,8 @@ function prepare() {
 function isolate() {
   remote([
     "set -euo pipefail",
+    "guest_hostname=\"$(hostname)\"",
+    "if ! grep -Fq \" $guest_hostname\" /etc/hosts; then sudo sed -i \"s/^127\\.0\\.0\\.1[[:space:]]\\+localhost$/& $guest_hostname/\" /etc/hosts; fi",
     "while IFS= read -r mounted; do sudo umount \"$mounted\"; done < <(findmnt -rn -t virtiofs -o TARGET)",
     "for firewall in iptables ip6tables; do",
     "  sudo $firewall -N OJ_AGENT_EGRESS 2>/dev/null || true",
