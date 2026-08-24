@@ -34,6 +34,15 @@ try {
 import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 
+const processLimit = fs.readFileSync("/proc/self/limits", "utf8")
+  .split("\\n")
+  .find((line) => line.startsWith("Max processes"))
+  ?.trim()
+  .split(/\\s+/)[2];
+if (Number(processLimit) < 2048) throw new Error("concurrent workers share an insufficient process budget");
+if (process.env.RAYON_NUM_THREADS !== "2") throw new Error("native worker pools must remain bounded");
+if (process.env.UV_THREADPOOL_SIZE !== "2") throw new Error("Node worker pools must remain bounded");
+
 if (process.getuid() === 0) throw new Error("project execution retained root privileges");
 if (fs.existsSync("/home") || fs.existsSync("/root")) throw new Error("host directories are visible");
 if (Object.keys(process.env).some((name) => /TOKEN|SECRET|CREDENTIAL/i.test(name))) {

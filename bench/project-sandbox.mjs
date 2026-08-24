@@ -204,7 +204,7 @@ mount --bind "$OJ_OUTPUT" "$OJ_JAIL/output"
 
 mount -t proc -o nosuid,nodev,noexec proc "$OJ_JAIL/proc"
 ip link set lo up
-ulimit -u 256
+ulimit -u 2048
 ulimit -n 1024
 ulimit -f 524288
 ulimit -t "$OJ_CPU_LIMIT"
@@ -213,7 +213,7 @@ exec chroot "$OJ_JAIL" /usr/bin/setpriv \
   --reuid "$OJ_UID" --regid "$OJ_GID" --clear-groups --no-new-privs \
   --inh-caps=-all --ambient-caps=-all --bounding-set=-all \
   /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/work/home \
-  TMPDIR=/work/tmp CI=1 NO_COLOR=1 \
+  TMPDIR=/work/tmp CI=1 NO_COLOR=1 RAYON_NUM_THREADS=2 UV_THREADPOOL_SIZE=2 \
   "$OJ_NODE" /runtime/bench/project-agent.mjs \
   --project /input/project.zip --dependency-layer /opt/node_modules \
   --oj /opt/bin/oj --workdir /work/staged --output-dir /output "$@"
