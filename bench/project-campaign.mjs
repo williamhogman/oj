@@ -347,7 +347,7 @@ function readWorkerReport(filename) {
 function invokeAgent(archive, options, baseline) {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "oj-campaign-worker-"));
   const report = path.join(temporary, "report.json");
-  const forwarded = ["--mode", baseline ? "build" : options.mode, "--timeout-ms", String(options.timeoutMs)];
+  const forwarded = ["--mode", baseline || options.mode, "--timeout-ms", String(options.timeoutMs)];
   if (baseline) forwarded.push("--baseline-only");
   let executable;
   let args;
@@ -442,11 +442,25 @@ async function evaluate(project, options) {
   const record = { id: project.id, kind: observed.kind, status, attempts: attempt, checks };
 
   if (status === "oj-failure" && options.baseline) {
-    const baselineRun = await invokeAgent(project.archive, options, true);
+    const baselineRun = await invokeAgent(project.archive, options, "build");
     const baseline = baselineRun.report?.projects?.[0]?.checks?.baseline;
     if (baseline) {
       record.baseline = diagnostic(baseline, "baseline", observed.kind);
       if (!baseline.ok) status = "baseline-failure";
+      else if (observed.kind === "tanstack-start" && checks.dev?.ok === false && checks.build?.ok !== false) {
+        const runtimeRun = await invokeAgent(project.archive, options, "dev");
+        const runtime = runtimeRun.report?.projects?.[0]?.checks?.baseline;
+        if (runtime) {
+          record.baseline = diagnostic(runtime, "baseline", observed.kind);
+          if (!runtime.ok) status = "baseline-failure";
+        } else {
+          record.baseline = diagnostic(
+            { ok: false, output: runtimeRun.timeout ? "baseline timeout" : "baseline unavailable" },
+            "baseline", observed.kind,
+          );
+          status = "infrastructure-failure";
+        }
+      }
     } else {
       record.baseline = diagnostic({ ok: false, output: baselineRun.timeout ? "baseline timeout" : "baseline unavailable" },
         "baseline", observed.kind);

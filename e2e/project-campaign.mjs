@@ -69,7 +69,17 @@ try {
   fs.writeFileSync(path.join(project, "index.html"), '<html><body><script type="module" src="/main.js"></script></body></html>');
   fs.writeFileSync(path.join(layer, ".bin", "vite"), [
     "#!/usr/bin/env node",
-    'require("node:fs").appendFileSync(process.env.CAMPAIGN_BASELINE_MARKER, "baseline\\n");',
+    'const fs = require("node:fs");',
+    'fs.appendFileSync(process.env.CAMPAIGN_BASELINE_MARKER, "baseline\\n");',
+    'const port = process.argv[process.argv.indexOf("--port") + 1];',
+    'if (process.argv.includes("--port")) {',
+    '  const source = fs.readFileSync(require("node:path").join(process.cwd(), "main.js"), "utf8");',
+    '  require("node:http").createServer((_request, response) => {',
+    '    if (source.includes("SHARED_SSR_FAILURE")) {',
+    '      response.writeHead(500); response.end("ReferenceError: synthetic runtime failure");',
+    '    } else { response.end("<html><body>synthetic SSR</body></html>"); }',
+    '  }).listen(Number(port), "127.0.0.1");',
+    '}',
   ].join("\n") + "\n", { mode: 0o755 });
   fs.writeFileSync(countingOj, [
     "#!/usr/bin/env node",
@@ -78,6 +88,16 @@ try {
     'const path = require("node:path");',
     'fs.appendFileSync(process.env.CAMPAIGN_OJ_MARKER, "oj\\n");',
     'const source = fs.readFileSync(path.join(process.argv[3], "main.js"), "utf8");',
+    'if (source.includes("SSR_FAILURE")) {',
+    '  if (process.argv[2] === "build") {',
+    '    fs.mkdirSync(path.join(process.argv[3], "dist"), { recursive: true }); process.exit(0);',
+    '  }',
+    '  const port = Number(process.argv[process.argv.indexOf("--port") + 1]);',
+    '  require("node:http").createServer((_request, response) => {',
+    '    response.writeHead(500); response.end("ReferenceError: synthetic runtime failure");',
+    '  }).listen(port, "127.0.0.1");',
+    '  return;',
+    '}',
     'if (source.includes("missing-example-dependency")) {',
     '  console.error(\'Error: Could not resolve "missing-example-dependency"\');',
     "  process.exit(1);",
@@ -248,6 +268,56 @@ try {
     .projects[0].checks), ["baseline"], "baseline-only reports must not contain OJ checks");
   assert.equal(fs.readFileSync(ojMarker, "utf8").trim().split("\n").length, buildsBeforeBaselineOnly,
     "baseline-only runner must never invoke OJ");
+
+  fs.writeFileSync(path.join(project, "package.json"), JSON.stringify({
+    type: "module", dependencies: { "@tanstack/react-start": "1.0.0" },
+  }));
+  createArchive("shared-ssr-failure", false, "// SHARED_SSR_FAILURE\n");
+  createArchive("oj-only-ssr-failure", false, "// OJ_ONLY_SSR_FAILURE\n");
+  fs.writeFileSync(path.join(project, "package.json"), JSON.stringify({ type: "module" }));
+
+  function runSsrParity(name) {
+    const destination = path.join(temporary, `${name}-results`);
+    const result = spawnSync(process.execPath, [
+      campaign,
+      "--archive", path.join(archives, `${name}.zip`),
+      "--dependency-layer", layer,
+      "--oj", countingOj,
+      "--output-dir", destination,
+      "--mode", "both",
+      "--timeout-ms", "5000",
+    ], {
+      cwd: root,
+      encoding: "utf8",
+      timeout: 30_000,
+      env: {
+        ...process.env,
+        CAMPAIGN_BASELINE_MARKER: marker,
+        CAMPAIGN_OJ_MARKER: ojMarker,
+        CAMPAIGN_REAL_OJ: path.join(root, "target", "debug", "oj"),
+      },
+    });
+    assert.equal(result.status, 0, `SSR parity campaign failed:\n${result.stdout}\n${result.stderr}`);
+    return {
+      result: JSON.parse(fs.readFileSync(path.join(destination, "results.jsonl"), "utf8").trim()),
+      clusters: JSON.parse(fs.readFileSync(path.join(destination, "clusters.json"), "utf8")),
+    };
+  }
+
+  const sharedSsrFailure = runSsrParity("shared-ssr-failure");
+  assert.equal(sharedSsrFailure.result.checks.build.ok, true);
+  assert.equal(sharedSsrFailure.result.checks.dev.ok, false);
+  assert.equal(sharedSsrFailure.result.baseline.ok, false,
+    "a successful production build must not conceal an SSR failure shared by the Vite dev server");
+  assert.equal(sharedSsrFailure.result.status, "baseline-failure");
+  assert.deepEqual(sharedSsrFailure.clusters.clusters, [],
+    "application SSR errors reproducible under Vite must not become OJ bug tasks");
+
+  const ojOnlySsrFailure = runSsrParity("oj-only-ssr-failure");
+  assert.equal(ojOnlySsrFailure.result.baseline.ok, true, JSON.stringify(ojOnlySsrFailure.result));
+  assert.equal(ojOnlySsrFailure.result.status, "oj-failure",
+    "an OJ-only SSR failure must remain actionable when Vite renders the same route");
+  assert.equal(ojOnlySsrFailure.clusters.clusters.length, 1);
 
   const manifest = path.join(temporary, "inputs.jsonl");
   const manifestOutput = path.join(temporary, "manifest-results");

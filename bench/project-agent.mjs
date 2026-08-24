@@ -20,7 +20,7 @@ function usage() {
   --install                  Install each project's actual npm dependencies
   --dependency-layer PATH    Reuse an existing node_modules directory
   --baseline                 Also run the project's Vite production build
-  --baseline-only            Run only the project's Vite production build
+  --baseline-only            Run only the matching Vite production build or dev server
   --output-dir PATH          Write report.json and per-project diagnostic logs
   --oj PATH                  OJ executable (default: target/debug/oj)
   --workdir PATH             Keep staged projects in a stable directory
@@ -337,7 +337,7 @@ async function probeModuleGraph(origin, entry, limit) {
   return visited.size;
 }
 
-async function runDev(project, directory, options) {
+async function runDev(project, directory, options, baseline = false) {
   const started = performance.now();
   let port;
   try {
@@ -345,8 +345,12 @@ async function runDev(project, directory, options) {
   } catch (error) {
     return { ok: false, durationMs: Math.round(performance.now() - started), output: error.message };
   }
-  const child = spawn(options.oj, ["dev", directory, "--port", String(port), "--host=127.0.0.1"], {
-    cwd: ojRoot,
+  const executable = baseline ? path.join(directory, "node_modules", ".bin", "vite") : options.oj;
+  const args = baseline
+    ? ["--host", "127.0.0.1", "--port", String(port), "--strictPort"]
+    : ["dev", directory, "--port", String(port), "--host=127.0.0.1"];
+  const child = spawn(executable, args, {
+    cwd: baseline ? directory : ojRoot,
     env: { ...process.env, NO_COLOR: "1", CI: "1" },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -481,7 +485,11 @@ async function main() {
 
       result.kind = project.kind;
       if (options.baseline) {
-        result.checks.baseline = diagnose(runBaseline(directory, options));
+        result.checks.baseline = diagnose(
+          options.baselineOnly && options.mode === "dev"
+            ? await runDev(project, directory, options, true)
+            : runBaseline(directory, options),
+        );
         const baseline = result.checks.baseline;
         console.log(`  ${baseline.ok ? "PASS" : "FAIL"} vite   ${baseline.durationMs}ms${baseline.ok ? "" : `  ${summarizeFailure(baseline.output)}`}`);
       }
