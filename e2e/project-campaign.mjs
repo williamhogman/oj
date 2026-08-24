@@ -370,9 +370,11 @@ try {
     'const archive = args[args.indexOf("--archive") + 1];',
     'const dependencies = args[args.indexOf("--dependencies") + 1];',
     'const output = args[args.indexOf("--output") + 1];',
+    'const binary = args[args.indexOf("--oj") + 1];',
     'const forwarded = args.slice(args.indexOf("--") + 1);',
+    'if (process.env.CAMPAIGN_SANDBOX_MARKER) fs.appendFileSync(process.env.CAMPAIGN_SANDBOX_MARKER, "sandbox\\n");',
     'const command = [path.join(process.env.CAMPAIGN_TEST_ROOT, "bench/project-agent.mjs"),',
-    '  "--project", archive, "--dependency-layer", dependencies, "--output-dir", output, ...forwarded];',
+    '  "--project", archive, "--dependency-layer", dependencies, "--oj", binary, "--output-dir", output, ...forwarded];',
     'const result = spawnSync(process.execPath, command, { stdio: "inherit" });',
     'if (process.env.CAMPAIGN_SANDBOX_TARGET) {',
     '  const report = path.join(output, "report.json");',
@@ -405,6 +407,83 @@ try {
   assert.equal(isolated.status, 0, `sandbox campaign failed:\n${isolated.stdout}\n${isolated.stderr}`);
   assert.equal(JSON.parse(fs.readFileSync(path.join(isolatedOutput, "summary.json"), "utf8")).passed, 1,
     "isolated workers must consume the sandbox report contract");
+
+  const isolatedFailureOutput = path.join(temporary, "isolated-failure-results");
+  const sandboxMarker = path.join(temporary, "sandbox-count");
+  const isolatedFailure = spawnSync(process.execPath, [
+    campaign,
+    "--archive", path.join(archives, "example-08.zip"),
+    "--dependency-layer", layer,
+    "--oj", countingOj,
+    "--output-dir", isolatedFailureOutput,
+    "--mode", "build",
+    "--sandbox-command", sandbox,
+    "--require-isolation",
+  ], {
+    cwd: root,
+    encoding: "utf8",
+    timeout: 30_000,
+    env: {
+      ...process.env,
+      PATH: `${shimDirectory}${path.delimiter}${process.env.PATH}`,
+      CAMPAIGN_TEST_ROOT: root,
+      CAMPAIGN_SANDBOX_MARKER: sandboxMarker,
+      CAMPAIGN_BASELINE_MARKER: marker,
+      CAMPAIGN_OJ_MARKER: ojMarker,
+      CAMPAIGN_REAL_OJ: path.join(root, "target", "debug", "oj"),
+    },
+  });
+  assert.equal(isolatedFailure.status, 0,
+    `isolated failing-project campaign failed:\n${isolatedFailure.stdout}\n${isolatedFailure.stderr}`);
+  const isolatedFailureRecord = JSON.parse(
+    fs.readFileSync(path.join(isolatedFailureOutput, "results.jsonl"), "utf8").trim(),
+  );
+  assert.equal(isolatedFailureRecord.status, "oj-failure");
+  assert.equal(isolatedFailureRecord.checks.build.ok, false);
+  assert.equal(isolatedFailureRecord.baseline.ok, true);
+  assert.equal(fs.readFileSync(sandboxMarker, "utf8").trim().split("\n").length, 1,
+    "OJ checks and their conditional baseline must share one isolated project sandbox");
+
+  for (const [name, expectedStatus] of [
+    ["shared-ssr-failure", "baseline-failure"],
+    ["oj-only-ssr-failure", "oj-failure"],
+  ]) {
+    const destination = path.join(temporary, `isolated-${name}-results`);
+    const invocationMarker = path.join(temporary, `isolated-${name}-sandbox-count`);
+    const isolatedParity = spawnSync(process.execPath, [
+      campaign,
+      "--archive", path.join(archives, `${name}.zip`),
+      "--dependency-layer", layer,
+      "--oj", countingOj,
+      "--output-dir", destination,
+      "--mode", "both",
+      "--timeout-ms", "5000",
+      "--sandbox-command", sandbox,
+      "--require-isolation",
+    ], {
+      cwd: root,
+      encoding: "utf8",
+      timeout: 30_000,
+      env: {
+        ...process.env,
+        PATH: `${shimDirectory}${path.delimiter}${process.env.PATH}`,
+        CAMPAIGN_TEST_ROOT: root,
+        CAMPAIGN_SANDBOX_MARKER: invocationMarker,
+        CAMPAIGN_BASELINE_MARKER: marker,
+        CAMPAIGN_OJ_MARKER: ojMarker,
+        CAMPAIGN_REAL_OJ: path.join(root, "target", "debug", "oj"),
+      },
+    });
+    assert.equal(isolatedParity.status, 0,
+      `isolated SSR parity campaign failed:\n${isolatedParity.stdout}\n${isolatedParity.stderr}`);
+    const parityRecord = JSON.parse(fs.readFileSync(path.join(destination, "results.jsonl"), "utf8").trim());
+    assert.equal(parityRecord.checks.build.ok, true);
+    assert.equal(parityRecord.checks.dev.ok, false);
+    assert.equal(parityRecord.baseline.ok, expectedStatus === "oj-failure");
+    assert.equal(parityRecord.status, expectedStatus);
+    assert.equal(fs.readFileSync(invocationMarker, "utf8").trim().split("\n").length, 1,
+      "TanStack production and SSR baselines must stay inside the original isolated project sandbox");
+  }
 
   const externalReport = path.join(temporary, "outside-report.json");
   fs.writeFileSync(externalReport, JSON.stringify({

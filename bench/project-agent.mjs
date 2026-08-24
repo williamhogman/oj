@@ -21,6 +21,7 @@ function usage() {
   --dependency-layer PATH    Reuse an existing node_modules directory
   --baseline                 Also run the project's Vite production build
   --baseline-only            Run only the matching Vite production build or dev server
+  --baseline-on-failure      Verify failed OJ checks against Vite in the same project run
   --output-dir PATH          Write report.json and per-project diagnostic logs
   --oj PATH                  OJ executable (default: target/debug/oj)
   --workdir PATH             Keep staged projects in a stable directory
@@ -46,6 +47,7 @@ function parseArgs(argv) {
     install: false,
     baseline: false,
     baselineOnly: false,
+    baselineOnFailure: false,
     keep: false,
     list: false,
     oj: path.join(ojRoot, "target", "debug", "oj"),
@@ -76,6 +78,7 @@ function parseArgs(argv) {
       case "--install": options.install = true; break;
       case "--baseline": options.baseline = true; break;
       case "--baseline-only": options.baseline = true; options.baselineOnly = true; break;
+      case "--baseline-on-failure": options.baselineOnFailure = true; break;
       case "--keep": options.keep = true; break;
       case "--list": options.list = true; break;
       case "--help": console.log(usage()); process.exit(0);
@@ -85,6 +88,9 @@ function parseArgs(argv) {
 
   if (options.projects.length === 0 && options.projectsDirs.length === 0) {
     throw new Error("at least one --project or --projects-dir is required");
+  }
+  if (options.baselineOnFailure && (options.baseline || options.baselineOnly)) {
+    throw new Error("--baseline-on-failure cannot be combined with --baseline or --baseline-only");
   }
   if (!["build", "dev", "both"].includes(options.mode)) throw new Error(`invalid mode: ${options.mode}`);
   if (!Number.isSafeInteger(options.limit) || options.limit < 1) throw new Error("--limit must be positive");
@@ -504,6 +510,16 @@ async function main() {
         result.checks.dev = diagnose(await runDev(project, directory, options));
         const dev = result.checks.dev;
         console.log(`  ${dev.ok ? "PASS" : "FAIL"} dev    ${dev.durationMs}ms${dev.ok ? "" : `  ${summarizeFailure(dev.output)}`}`);
+      }
+
+      if (options.baselineOnFailure && Object.values(result.checks).some((check) => !check.ok)) {
+        result.checks.baseline = diagnose(runBaseline(directory, options));
+        if (result.checks.baseline.ok && project.kind === "tanstack-start" &&
+          result.checks.dev?.ok === false && result.checks.build?.ok !== false) {
+          result.checks.baseline = diagnose(await runDev(project, directory, options, true));
+        }
+        const baseline = result.checks.baseline;
+        console.log(`  ${baseline.ok ? "PASS" : "FAIL"} vite   ${baseline.durationMs}ms${baseline.ok ? "" : `  ${summarizeFailure(baseline.output)}`}`);
       }
     }
   } finally {

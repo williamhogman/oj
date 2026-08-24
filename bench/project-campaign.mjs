@@ -349,6 +349,7 @@ function invokeAgent(archive, options, baseline) {
   const report = path.join(temporary, "report.json");
   const forwarded = ["--mode", baseline || options.mode, "--timeout-ms", String(options.timeoutMs)];
   if (baseline) forwarded.push("--baseline-only");
+  else if (options.baseline) forwarded.push("--baseline-on-failure");
   let executable;
   let args;
   if (options.sandbox) {
@@ -372,12 +373,14 @@ function invokeAgent(archive, options, baseline) {
     const capture = (chunk) => { output = (output + chunk.toString()).slice(-8192); };
     child.stdout.on("data", capture);
     child.stderr.on("data", capture);
+    const checkBudget = baseline ? 2 : options.baseline && options.mode === "both" ? 4 :
+      options.mode === "both" || (options.baseline && options.mode === "dev") ? 3 : 2;
     const deadline = setTimeout(() => {
       timeout = true;
       child.kill("SIGTERM");
       const force = setTimeout(() => child.kill("SIGKILL"), 2_000);
       force.unref();
-    }, options.timeoutMs * (baseline ? 2 : options.mode === "both" ? 3 : 2) + 10_000);
+    }, options.timeoutMs * checkBudget + 10_000);
 
     let finished = false;
     const finish = (status, error) => {
@@ -434,35 +437,21 @@ async function evaluate(project, options) {
     return { id: project.id, status: "infrastructure-failure", attempts: attempt, checks: { worker: check } };
   }
 
-  const checks = Object.fromEntries(Object.entries(observed.checks ?? {}).map(([stage, check]) =>
-    [stage, diagnostic(check, stage, observed.kind)]));
+  const checks = Object.fromEntries(Object.entries(observed.checks ?? {})
+    .filter(([stage]) => stage !== "baseline")
+    .map(([stage, check]) => [stage, diagnostic(check, stage, observed.kind)]));
   const failures = failedChecks({ checks });
   let status = failures.length === 0 ? "passed" : failures.some(([stage]) => stage === "install")
     ? "infrastructure-failure" : "oj-failure";
   const record = { id: project.id, kind: observed.kind, status, attempts: attempt, checks };
 
   if (status === "oj-failure" && options.baseline) {
-    const baselineRun = await invokeAgent(project.archive, options, "build");
-    const baseline = baselineRun.report?.projects?.[0]?.checks?.baseline;
+    const baseline = observed.checks?.baseline;
     if (baseline) {
       record.baseline = diagnostic(baseline, "baseline", observed.kind);
       if (!baseline.ok) status = "baseline-failure";
-      else if (observed.kind === "tanstack-start" && checks.dev?.ok === false && checks.build?.ok !== false) {
-        const runtimeRun = await invokeAgent(project.archive, options, "dev");
-        const runtime = runtimeRun.report?.projects?.[0]?.checks?.baseline;
-        if (runtime) {
-          record.baseline = diagnostic(runtime, "baseline", observed.kind);
-          if (!runtime.ok) status = "baseline-failure";
-        } else {
-          record.baseline = diagnostic(
-            { ok: false, output: runtimeRun.timeout ? "baseline timeout" : "baseline unavailable" },
-            "baseline", observed.kind,
-          );
-          status = "infrastructure-failure";
-        }
-      }
     } else {
-      record.baseline = diagnostic({ ok: false, output: baselineRun.timeout ? "baseline timeout" : "baseline unavailable" },
+      record.baseline = diagnostic({ ok: false, output: "baseline unavailable" },
         "baseline", observed.kind);
       status = "infrastructure-failure";
     }
