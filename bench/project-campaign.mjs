@@ -253,7 +253,14 @@ function diagnostic(check, stage, projectKind) {
   const errorCode = stableErrorCodes.has(candidateCode) || /^HTTP\s+[1-5]\d{2}$/.test(candidateCode)
     ? candidateCode : "";
   const message = failureMessage(rawMessage, kind, errorCode);
-  const canonical = ["v1", stage, projectKind ?? "unknown", kind, errorCode, message.toLowerCase()].join("\u0000");
+  const structure = sanitize(rawMessage)
+    .replaceAll(/\b0x[0-9a-f]+\b/gi, "<number>")
+    .replaceAll(/\b\d+\b/g, "<number>")
+    .toLowerCase();
+  const canonical = [
+    "v1", stage, projectKind ?? "unknown", kind, errorCode, message.toLowerCase(),
+    ...(kind === "execution-failure" ? [structure] : []),
+  ].join("\u0000");
   return {
     ok: false,
     kind,
@@ -287,7 +294,7 @@ function invokeAgent(archive, options, baseline) {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "oj-campaign-worker-"));
   const report = path.join(temporary, "report.json");
   const forwarded = ["--mode", baseline ? "build" : options.mode, "--timeout-ms", String(options.timeoutMs)];
-  if (baseline) forwarded.push("--baseline");
+  if (baseline) forwarded.push("--baseline-only");
   let executable;
   let args;
   if (options.sandbox) {
@@ -316,7 +323,7 @@ function invokeAgent(archive, options, baseline) {
       child.kill("SIGTERM");
       const force = setTimeout(() => child.kill("SIGKILL"), 2_000);
       force.unref();
-    }, options.timeoutMs * (baseline ? 3 : options.mode === "both" ? 3 : 2) + 10_000);
+    }, options.timeoutMs * (baseline ? 2 : options.mode === "both" ? 3 : 2) + 10_000);
 
     let finished = false;
     const finish = (status, error) => {

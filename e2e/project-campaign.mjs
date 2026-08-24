@@ -14,12 +14,14 @@ const project = path.join(temporary, "sample-project");
 const layer = path.join(temporary, "dependencies");
 const output = path.join(temporary, "results");
 const marker = path.join(temporary, "baseline-count");
+const ojMarker = path.join(temporary, "oj-count");
+const countingOj = path.join(temporary, "counting-oj");
 const campaign = path.join(root, "bench", "project-campaign.mjs");
 
-function createArchive(name, missing = false) {
-  const source = missing
+function createArchive(name, missing = false, replacement) {
+  const source = replacement ?? (missing
     ? 'import "missing-example-dependency";\n'
-    : 'document.body.textContent = "ready";\n';
+    : 'document.body.textContent = "ready";\n');
   fs.writeFileSync(path.join(project, "main.js"), source);
   const packed = spawnSync("zip", ["-q", "-r", path.join(archives, `${name}.zip`), "sample-project"], {
     cwd: temporary,
@@ -33,6 +35,7 @@ function run(args = []) {
     campaign,
     "--archives-dir", archives,
     "--dependency-layer", layer,
+    "--oj", countingOj,
     "--output-dir", output,
     "--workers", "3",
     "--batch-size", "4",
@@ -42,7 +45,12 @@ function run(args = []) {
   ], {
     cwd: root,
     encoding: "utf8",
-    env: { ...process.env, CAMPAIGN_BASELINE_MARKER: marker },
+    env: {
+      ...process.env,
+      CAMPAIGN_BASELINE_MARKER: marker,
+      CAMPAIGN_OJ_MARKER: ojMarker,
+      CAMPAIGN_REAL_OJ: path.join(root, "target", "debug", "oj"),
+    },
     timeout: 90_000,
   });
 }
@@ -63,6 +71,32 @@ try {
     "#!/usr/bin/env node",
     'require("node:fs").appendFileSync(process.env.CAMPAIGN_BASELINE_MARKER, "baseline\\n");',
   ].join("\n") + "\n", { mode: 0o755 });
+  fs.writeFileSync(countingOj, [
+    "#!/usr/bin/env node",
+    'const fs = require("node:fs");',
+    'const { spawnSync } = require("node:child_process");',
+    'const path = require("node:path");',
+    'fs.appendFileSync(process.env.CAMPAIGN_OJ_MARKER, "oj\\n");',
+    'const source = fs.readFileSync(path.join(process.argv[3], "main.js"), "utf8");',
+    'if (source.includes("missing-example-dependency")) {',
+    '  console.error(\'Error: Could not resolve "missing-example-dependency"\');',
+    "  process.exit(1);",
+    "}",
+    'if (source.includes("STRUCTURAL_ALPHA_ONE")) {',
+    '  console.error(\'Error: circular graph recursion exceeded in "customer-one-private"\');',
+    "  process.exit(1);",
+    "}",
+    'if (source.includes("STRUCTURAL_ALPHA_TWO")) {',
+    '  console.error(\'Error: circular graph recursion exceeded in "customer-two-private"\');',
+    "  process.exit(1);",
+    "}",
+    'if (source.includes("STRUCTURAL_BETA")) {',
+    '  console.error(\'Error: invalid object spread encountered in "customer-three-private"\');',
+    "  process.exit(1);",
+    "}",
+    'const result = spawnSync(process.env.CAMPAIGN_REAL_OJ, process.argv.slice(2), { stdio: "inherit" });',
+    "process.exit(result.status ?? 1);",
+  ].join("\n") + "\n", { mode: 0o755 });
 
   for (let index = 0; index < 11; index += 1) {
     createArchive(`example-${String(index).padStart(2, "0")}`, index >= 8);
@@ -78,6 +112,8 @@ try {
   assert.equal(summary.baselineFailures, 0);
   assert.equal(summary.clusters, 1, "equivalent failures should form one canonical cluster");
   assert.equal(readJournal().length, 11);
+  assert.equal(fs.readFileSync(ojMarker, "utf8").trim().split("\n").length, 11,
+    "baseline verification must not repeat the failed OJ build");
   assert.equal(fs.readFileSync(marker, "utf8").trim().split("\n").length, 3,
     "successful projects must not trigger baseline checks");
 
@@ -120,6 +156,50 @@ try {
   const sanitizedRecords = fs.readFileSync(path.join(output, "results.jsonl"), "utf8");
   assert.doesNotMatch(sanitizedRecords, /IGNORE.PREVIOUS|not-for-reports|person@example\.invalid/i,
     "untrusted project diagnostics must never become stored instructions, secrets, or contact details");
+
+  createArchive("structural-alpha-one", false, "// STRUCTURAL_ALPHA_ONE\n");
+  createArchive("structural-alpha-two", false, "// STRUCTURAL_ALPHA_TWO\n");
+  createArchive("structural-beta", false, "// STRUCTURAL_BETA\n");
+  const structural = run();
+  assert.equal(structural.status, 0, `structural diagnostic campaign failed:\n${structural.stdout}\n${structural.stderr}`);
+  const structuralClusters = JSON.parse(fs.readFileSync(path.join(output, "clusters.json"), "utf8"))
+    .clusters.filter((cluster) => cluster.kind === "execution-failure"
+      && cluster.message === "The compatibility check failed");
+  assert.equal(structuralClusters.length, 2,
+    "distinct structural failures with the same public message must form separate anonymous clusters");
+  assert.deepEqual(structuralClusters.map((cluster) => cluster.count).sort(), [1, 2],
+    "structurally equivalent errors differing only in private values must remain grouped");
+  const structuralResults = ["results.jsonl", "summary.json", "clusters.json"]
+    .map((filename) => fs.readFileSync(path.join(output, filename), "utf8")).join("\n");
+  assert.doesNotMatch(structuralResults,
+    /customer-(?:one|two|three)-private|STRUCTURAL_ALPHA|STRUCTURAL_BETA|circular graph|object spread/i,
+    "structural fingerprinting must never persist customer values, source identifiers, or raw diagnostics");
+
+  const baselineOnlyOutput = path.join(temporary, "baseline-only-results");
+  const buildsBeforeBaselineOnly = fs.readFileSync(ojMarker, "utf8").trim().split("\n").length;
+  const baselineOnly = spawnSync(process.execPath, [
+    path.join(root, "bench", "project-agent.mjs"),
+    "--project", path.join(archives, "example-00.zip"),
+    "--dependency-layer", layer,
+    "--oj", countingOj,
+    "--mode", "build",
+    "--baseline-only",
+    "--output-dir", baselineOnlyOutput,
+  ], {
+    cwd: root,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      CAMPAIGN_BASELINE_MARKER: marker,
+      CAMPAIGN_OJ_MARKER: ojMarker,
+      CAMPAIGN_REAL_OJ: path.join(root, "target", "debug", "oj"),
+    },
+  });
+  assert.equal(baselineOnly.status, 0, `baseline-only runner failed:\n${baselineOnly.stdout}\n${baselineOnly.stderr}`);
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(path.join(baselineOnlyOutput, "report.json"), "utf8"))
+    .projects[0].checks), ["baseline"], "baseline-only reports must not contain OJ checks");
+  assert.equal(fs.readFileSync(ojMarker, "utf8").trim().split("\n").length, buildsBeforeBaselineOnly,
+    "baseline-only runner must never invoke OJ");
 
   const manifest = path.join(temporary, "inputs.jsonl");
   const manifestOutput = path.join(temporary, "manifest-results");

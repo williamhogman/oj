@@ -97,7 +97,7 @@ function validate() {
   }
   for (let index = 0; index < options.forwarded.length; index += 1) {
     const argument = options.forwarded[index];
-    if (argument === "--baseline") continue;
+    if (argument === "--baseline" || argument === "--baseline-only") continue;
     if (["--mode", "--timeout-ms", "--probe-modules"].includes(argument)) {
       if (!options.forwarded[++index]) throw new Error(`${argument} requires a value`);
       continue;

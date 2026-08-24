@@ -19,10 +19,14 @@ const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "oj-sandbox-contract-"))
 const project = path.join(temporary, "example");
 const archive = path.join(temporary, "example.zip");
 const output = path.join(temporary, "output");
+const baselineOutput = path.join(temporary, "baseline-output");
+const failingBinary = path.join(temporary, "must-not-run-oj");
 
 try {
   fs.mkdirSync(project);
   fs.mkdirSync(output, { mode: 0o700 });
+  fs.mkdirSync(baselineOutput, { mode: 0o700 });
+  fs.writeFileSync(failingBinary, "#!/bin/sh\nexit 42\n", { mode: 0o755 });
   fs.writeFileSync(path.join(project, "package.json"), JSON.stringify({ type: "module" }));
   fs.writeFileSync(path.join(project, "index.html"), '<html><body><script type="module" src="/main.js"></script></body></html>');
   fs.writeFileSync(path.join(project, "main.js"), 'document.body.textContent = "isolated";\n');
@@ -70,6 +74,20 @@ export default {};
   const report = JSON.parse(fs.readFileSync(path.join(output, "report.json"), "utf8"));
   assert.equal(report.summary.failed, 0);
   assert.equal(fs.statSync(output).uid, process.getuid());
+
+  const baselineOnly = spawnSync("sudo", [
+    "-n", process.execPath, path.join(root, "bench", "project-sandbox.mjs"),
+    "--archive", archive,
+    "--dependencies", dependencies,
+    "--output", baselineOutput,
+    "--oj", failingBinary,
+    "--", "--mode", "build", "--timeout-ms", "15000", "--baseline-only",
+  ], { cwd: root, encoding: "utf8" });
+  assert.equal(baselineOnly.status, 0,
+    `isolated baseline-only project failed:\n${baselineOnly.stdout}\n${baselineOnly.stderr}`);
+  const baselineReport = JSON.parse(fs.readFileSync(path.join(baselineOutput, "report.json"), "utf8"));
+  assert.deepEqual(Object.keys(baselineReport.projects[0].checks), ["baseline"],
+    "isolated baseline verification must not invoke or report an OJ build");
 
   const escaped = spawnSync("sudo", [
     "-n", process.execPath, path.join(root, "bench", "project-sandbox.mjs"),

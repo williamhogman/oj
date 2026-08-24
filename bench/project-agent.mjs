@@ -20,6 +20,7 @@ function usage() {
   --install                  Install each project's actual npm dependencies
   --dependency-layer PATH    Reuse an existing node_modules directory
   --baseline                 Also run the project's Vite production build
+  --baseline-only            Run only the project's Vite production build
   --output-dir PATH          Write report.json and per-project diagnostic logs
   --oj PATH                  OJ executable (default: target/debug/oj)
   --workdir PATH             Keep staged projects in a stable directory
@@ -44,6 +45,7 @@ function parseArgs(argv) {
     probeModules: 16,
     install: false,
     baseline: false,
+    baselineOnly: false,
     keep: false,
     list: false,
     oj: path.join(ojRoot, "target", "debug", "oj"),
@@ -73,6 +75,7 @@ function parseArgs(argv) {
       case "--output-dir": options.outputDir = path.resolve(value()); break;
       case "--install": options.install = true; break;
       case "--baseline": options.baseline = true; break;
+      case "--baseline-only": options.baseline = true; options.baselineOnly = true; break;
       case "--keep": options.keep = true; break;
       case "--list": options.list = true; break;
       case "--help": console.log(usage()); process.exit(0);
@@ -483,13 +486,13 @@ async function main() {
         console.log(`  ${baseline.ok ? "PASS" : "FAIL"} vite   ${baseline.durationMs}ms${baseline.ok ? "" : `  ${summarizeFailure(baseline.output)}`}`);
       }
 
-      if (options.mode !== "dev") {
+      if (!options.baselineOnly && options.mode !== "dev") {
         result.checks.build = diagnose(runBuild(project, directory, options));
         const build = result.checks.build;
         console.log(`  ${build.ok ? "PASS" : "FAIL"} build  ${build.durationMs}ms${build.ok ? "" : `  ${summarizeFailure(build.output)}`}`);
       }
 
-      if (options.mode !== "build") {
+      if (!options.baselineOnly && options.mode !== "build") {
         result.checks.dev = diagnose(await runDev(project, directory, options));
         const dev = result.checks.dev;
         console.log(`  ${dev.ok ? "PASS" : "FAIL"} dev    ${dev.durationMs}ms${dev.ok ? "" : `  ${summarizeFailure(dev.output)}`}`);
