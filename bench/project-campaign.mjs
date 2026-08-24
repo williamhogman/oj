@@ -238,6 +238,58 @@ function failureMessage(value, kind, code) {
   return code ? `${message} (${code})` : message;
 }
 
+const publicDiagnosticSymbols = [
+  ["rolldown", /\brolldown\b/i],
+  ["@tanstack/router-generator", /@tanstack\/router-generator\b/i],
+  ["@tanstack/react-start", /@tanstack\/react-start\b/i],
+  ["@vitejs/plugin-react-swc", /@vitejs\/plugin-react-swc\b/i],
+  ["@vitejs/plugin-react", /@vitejs\/plugin-react\b(?!-swc)/i],
+  ["postcss", /\bpostcss\b/i],
+  ["tailwindcss", /\btailwindcss\b/i],
+];
+
+const publicDiagnosticFrames = [
+  ["vite-plugin-bridge", /\bvite-plugin-bridge\.mjs\b/i],
+  ["rolldown-assets", /\brolldown-assets\.mjs\b/i],
+  ["route-generator", /\bgenerate\.mjs\b/i],
+  ["server-function-resolver", /\bgen-resolver\.mjs\b/i],
+  ["client-bundle", /\bbundle-client\.mjs\b/i],
+  ["package-resolver", /\bresolve-pkg\.mjs\b/i],
+];
+
+const publicDiagnosticMarkers = [
+  ["plugin-transform", /plugin[^\n]{0,120}\btransform\b|\btransform\b[^\n]{0,120}plugin/i],
+  ["plugin-resolve", /plugin[^\n]{0,120}\bresolve(?:id)?\b|\bresolve(?:id)?\b[^\n]{0,120}plugin/i],
+  ["plugin-load", /plugin[^\n]{0,120}\bload\b|\bload\b[^\n]{0,120}plugin/i],
+  ["plugin-build-start", /plugin[^\n]{0,120}\bbuildStart\b|\bbuildStart\b[^\n]{0,120}plugin/i],
+  ["route-generation", /route tree generation|router.generator/i],
+  ["property-of-nullish", /Cannot read propert(?:y|ies) of (?:undefined|null)/i],
+  ["server-exited", /server exited|server reported a fatal startup error/i],
+  ["config-load", /failed to load (?:vite )?config|configuration could not be loaded/i],
+  ["virtual-module", /virtual module|\bvirtual:/i],
+];
+
+const publicNullishProperties = new Set([
+  "map", "filter", "name", "options", "plugins", "routes", "config", "consumer", "resolve", "transform", "buildStart",
+]);
+
+function publicDiagnosticTaxonomy(check, summary) {
+  const input = `${String(summary ?? "")}\n${String(check.output ?? "")}`;
+  const errorClass = input.match(/\b(TypeError|ReferenceError|SyntaxError|RangeError|URIError|AggregateError|Error):/)?.[1];
+  const markers = publicDiagnosticMarkers.filter(([, expression]) => expression.test(input)).map(([marker]) => marker);
+  const publicSymbols = publicDiagnosticSymbols.filter(([, expression]) => expression.test(input)).map(([symbol]) => symbol);
+  const internalFrames = publicDiagnosticFrames.filter(([, expression]) => expression.test(input)).map(([frame]) => frame);
+  const candidateProperty = input.match(/Cannot read propert(?:y|ies) of (?:undefined|null)\s*\(reading ['"]([\w$]+)['"]\)/i)?.[1];
+  const nullishProperty = publicNullishProperties.has(candidateProperty) ? candidateProperty : undefined;
+  return {
+    ...(errorClass ? { errorClass } : {}),
+    ...(markers.length ? { markers } : {}),
+    ...(publicSymbols.length ? { publicSymbols } : {}),
+    ...(internalFrames.length ? { internalFrames } : {}),
+    ...(nullishProperty ? { nullishProperty } : {}),
+  };
+}
+
 function diagnostic(check, stage, projectKind) {
   if (check.ok) {
     return {
@@ -253,19 +305,21 @@ function diagnostic(check, stage, projectKind) {
   const errorCode = stableErrorCodes.has(candidateCode) || /^HTTP\s+[1-5]\d{2}$/.test(candidateCode)
     ? candidateCode : "";
   const message = failureMessage(rawMessage, kind, errorCode);
+  const taxonomy = publicDiagnosticTaxonomy(check, rawMessage);
   const structure = sanitize(rawMessage)
     .replaceAll(/\b0x[0-9a-f]+\b/gi, "<number>")
     .replaceAll(/\b\d+\b/g, "<number>")
     .toLowerCase();
   const canonical = [
     "v1", stage, projectKind ?? "unknown", kind, errorCode, message.toLowerCase(),
-    ...(kind === "execution-failure" ? [structure] : []),
+    ...(kind === "execution-failure" ? [structure, JSON.stringify(taxonomy)] : []),
   ].join("\u0000");
   return {
     ok: false,
     kind,
     message,
     fingerprint: digest(canonical).slice(0, 32),
+    ...taxonomy,
     ...(errorCode ? { errorCode } : {}),
     ...(Number.isFinite(check.durationMs) ? { durationMs: check.durationMs } : {}),
   };
@@ -434,6 +488,11 @@ function summarize(records, discovered) {
         stage,
         kind: check.kind,
         message: check.message,
+        ...(check.errorClass ? { errorClass: check.errorClass } : {}),
+        ...(check.markers ? { markers: check.markers } : {}),
+        ...(check.publicSymbols ? { publicSymbols: check.publicSymbols } : {}),
+        ...(check.internalFrames ? { internalFrames: check.internalFrames } : {}),
+        ...(check.nullishProperty ? { nullishProperty: check.nullishProperty } : {}),
         count: 0,
         occurrences: 0,
         projects: [],

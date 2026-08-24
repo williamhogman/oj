@@ -94,6 +94,26 @@ try {
     '  console.error(\'Error: invalid object spread encountered in "customer-three-private"\');',
     "  process.exit(1);",
     "}",
+    'if (source.includes("TAXONOMY_ALPHA_ONE") || source.includes("TAXONOMY_ALPHA_TWO")) {',
+    '  const customer = source.includes("TAXONOMY_ALPHA_ONE") ? "customer-alpha-private" : "customer-beta-private";',
+    "  console.error(\"TypeError: Cannot read properties of undefined (reading 'options')\");",
+    '  console.error(`plugin transform failed in ${customer} @secret/private-plugin CUSTOMER_SOURCE_DO_NOT_STORE`);',
+    '  console.error(`at /private/${customer}/node_modules/rolldown/vite-plugin-bridge.mjs:42:7`);',
+    '  console.error("api_key=never-persist contact=person@example.invalid id=123e4567-e89b-12d3-a456-426614174000");',
+    "  process.exit(1);",
+    "}",
+    'if (source.includes("TAXONOMY_BETA")) {',
+    "  console.error(\"TypeError: Cannot read properties of undefined (reading 'routes')\");",
+    '  console.error("plugin transform failed in customer-gamma-private @secret/another-plugin");',
+    '  console.error("at /private/customer-gamma-private/node_modules/rolldown/vite-plugin-bridge.mjs:77:3");',
+    "  process.exit(1);",
+    "}",
+    'if (source.includes("TAXONOMY_PRIVATE_PROPERTY")) {',
+    "  console.error(\"TypeError: Cannot read properties of undefined (reading 'customerPrivateField')\");",
+    '  console.error("plugin transform failed in @secret/private-property-plugin");',
+    '  console.error("at /private/customer-delta-private/node_modules/rolldown/vite-plugin-bridge.mjs:88:5");',
+    "  process.exit(1);",
+    "}",
     'const result = spawnSync(process.env.CAMPAIGN_REAL_OJ, process.argv.slice(2), { stdio: "inherit" });',
     "process.exit(result.status ?? 1);",
   ].join("\n") + "\n", { mode: 0o755 });
@@ -174,6 +194,34 @@ try {
   assert.doesNotMatch(structuralResults,
     /customer-(?:one|two|three)-private|STRUCTURAL_ALPHA|STRUCTURAL_BETA|circular graph|object spread/i,
     "structural fingerprinting must never persist customer values, source identifiers, or raw diagnostics");
+
+  createArchive("taxonomy-alpha-one", false, "// TAXONOMY_ALPHA_ONE\n");
+  createArchive("taxonomy-alpha-two", false, "// TAXONOMY_ALPHA_TWO\n");
+  createArchive("taxonomy-beta", false, "// TAXONOMY_BETA\n");
+  createArchive("taxonomy-private-property", false, "// TAXONOMY_PRIVATE_PROPERTY\n");
+  const taxonomy = run();
+  assert.equal(taxonomy.status, 0, `diagnostic taxonomy campaign failed:\n${taxonomy.stdout}\n${taxonomy.stderr}`);
+  const taxonomyChecks = readJournal().map((record) => record.checks.build)
+    .filter((check) => check.errorClass === "TypeError");
+  assert.equal(taxonomyChecks.length, 4, "approved error classes should survive diagnostic redaction");
+  for (const check of taxonomyChecks) {
+    assert.ok(check.markers.includes("plugin-transform"), "public hook classes should remain actionable");
+    assert.ok(check.markers.includes("property-of-nullish"), "public JavaScript failure classes should remain actionable");
+    assert.deepEqual(check.publicSymbols, ["rolldown"], "only approved public package names may survive");
+    assert.deepEqual(check.internalFrames, ["vite-plugin-bridge"], "only approved public OJ frame classes may survive");
+  }
+  assert.deepEqual(taxonomyChecks.map((check) => check.nullishProperty).filter(Boolean).sort(), ["options", "options", "routes"]);
+  assert.equal(taxonomyChecks.filter((check) => check.nullishProperty === undefined).length, 1,
+    "private JavaScript property names must never appear in the public diagnostic taxonomy");
+  const taxonomyClusters = JSON.parse(fs.readFileSync(path.join(output, "clusters.json"), "utf8"))
+    .clusters.filter((cluster) => cluster.errorClass === "TypeError");
+  assert.deepEqual(taxonomyClusters.map((cluster) => cluster.count).sort(), [1, 1, 2],
+    "approved structural taxonomy should separate distinct public failure mechanisms without customer values");
+  const taxonomyResults = ["results.jsonl", "summary.json", "clusters.json"]
+    .map((filename) => fs.readFileSync(path.join(output, filename), "utf8")).join("\n");
+  assert.doesNotMatch(taxonomyResults,
+    /customer-(?:alpha|beta|gamma|delta)-private|@secret\/|customerPrivateField|CUSTOMER_SOURCE|TAXONOMY_ALPHA|TAXONOMY_BETA|TAXONOMY_PRIVATE|never-persist|person@example|123e4567|\/private\//i,
+    "diagnostic taxonomy must never persist customer paths, package names, source, secrets, contacts, or identifiers");
 
   const baselineOnlyOutput = path.join(temporary, "baseline-only-results");
   const buildsBeforeBaselineOnly = fs.readFileSync(ojMarker, "utf8").trim().split("\n").length;
