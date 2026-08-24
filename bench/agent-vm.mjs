@@ -254,6 +254,14 @@ function isolate() {
     "  sudo $firewall -C OUTPUT -j OJ_AGENT_EGRESS 2>/dev/null || sudo $firewall -I OUTPUT 1 -j OJ_AGENT_EGRESS",
     "done",
     "if curl --max-time 3 -fsS https://registry.npmjs.org/ >/dev/null 2>&1; then echo 'external egress is still available' >&2; exit 1; fi",
+    "if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved.service; then",
+    "  sudo touch /run/oj-agent-systemd-resolved-paused",
+    "  if ! sudo systemctl stop systemd-resolved.service; then",
+    "    sudo rm -f /run/oj-agent-systemd-resolved-paused",
+    "    echo 'failed to suspend the DNS resolver during isolation' >&2",
+    "    exit 1",
+    "  fi",
+    "fi",
     "echo 'Project isolation enabled: host mounts removed; IPv4 and IPv6 egress blocked.'",
   ].join("\n"));
 }
@@ -262,6 +270,11 @@ function restoreNetwork() {
   remote([
     "set -euo pipefail",
     `if find ${quote(`${options.guestRepo}/.agent-inputs`)} -type f -print -quit 2>/dev/null | grep -q .; then echo 'refusing network restoration while project archives remain in the VM' >&2; exit 1; fi`,
+    "if [ -f /run/oj-agent-systemd-resolved-paused ]; then",
+    "  sudo systemctl start systemd-resolved.service",
+    "  sudo systemctl is-active --quiet systemd-resolved.service",
+    "  sudo rm -f /run/oj-agent-systemd-resolved-paused",
+    "fi",
     "for firewall in iptables ip6tables; do",
     "  sudo $firewall -D OUTPUT -j OJ_AGENT_EGRESS 2>/dev/null || true",
     "  sudo $firewall -F OJ_AGENT_EGRESS 2>/dev/null || true",
