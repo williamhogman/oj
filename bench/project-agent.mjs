@@ -559,15 +559,22 @@ async function main() {
         result.checks.build = diagnose(await runBuild(project, directory, options));
         const build = result.checks.build;
         console.log(`  ${build.ok ? "PASS" : "FAIL"} build  ${build.durationMs}ms${build.ok ? "" : `  ${summarizeFailure(build.output)}`}`);
+        if (!build.ok && options.baselineOnFailure) {
+          result.checks.baseline = diagnose(await runBaseline(directory, options));
+          const baseline = result.checks.baseline;
+          console.log(`  ${baseline.ok ? "PASS" : "FAIL"} vite   ${baseline.durationMs}ms${baseline.ok ? "" : `  ${summarizeFailure(baseline.output)}`}`);
+        }
       }
 
-      if (!options.baselineOnly && options.mode !== "build") {
+      if (!options.baselineOnly && options.mode !== "build" &&
+        (!options.baselineOnFailure || result.checks.baseline?.ok !== false)) {
         result.checks.dev = diagnose(await runDev(project, directory, options));
         const dev = result.checks.dev;
         console.log(`  ${dev.ok ? "PASS" : "FAIL"} dev    ${dev.durationMs}ms${dev.ok ? "" : `  ${summarizeFailure(dev.output)}`}`);
       }
 
-      if (options.baselineOnFailure && Object.values(result.checks).some((check) => !check.ok)) {
+      if (options.baselineOnFailure && !result.checks.baseline &&
+        Object.values(result.checks).some((check) => !check.ok)) {
         result.checks.baseline = diagnose(await runBaseline(directory, options));
         if (result.checks.baseline.ok && project.kind === "tanstack-start" &&
           result.checks.dev?.ok === false && result.checks.build?.ok !== false) {

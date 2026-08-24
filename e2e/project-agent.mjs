@@ -168,6 +168,59 @@ try {
   assert.equal(missingReport.projects[0].checks.build.diagnostic.kind, "missing-dependency");
   assert.ok(missingReport.projects[0].checks.build.diagnostic.dependencies.includes("missing-agent-dependency"));
 
+  const failureLayer = path.join(temporary, "failure-dependencies");
+  const failureOj = path.join(temporary, "failure-oj");
+  const invocationOrder = path.join(temporary, "failure-invocations");
+  fs.mkdirSync(path.join(failureLayer, ".bin"), { recursive: true });
+  fs.writeFileSync(failureOj, [
+    "#!/usr/bin/env node",
+    'require("node:fs").appendFileSync(process.env.PROJECT_AGENT_INVOCATIONS, `oj:${process.argv[2]}\\n`);',
+    'console.error("Error: synthetic compatibility failure");',
+    "process.exit(1);",
+  ].join("\n") + "\n", { mode: 0o755 });
+  fs.writeFileSync(path.join(failureLayer, ".bin", "vite"), [
+    "#!/usr/bin/env node",
+    'require("node:fs").appendFileSync(process.env.PROJECT_AGENT_INVOCATIONS, `vite:${process.argv[2]}\\n`);',
+    "process.exit(Number(process.env.PROJECT_AGENT_BASELINE_STATUS));",
+  ].join("\n") + "\n", { mode: 0o755 });
+
+  for (const [baselineStatus, expectedInvocations, expectedChecks] of [
+    [1, ["oj:build", "vite:build"], ["build", "baseline"]],
+    [0, ["oj:build", "vite:build", "oj:dev"], ["build", "baseline", "dev"]],
+  ]) {
+    const failureOutput = path.join(temporary, `baseline-failure-${baselineStatus}`);
+    fs.writeFileSync(invocationOrder, "");
+    const failed = spawnSync(process.execPath, [
+      path.join(root, "bench", "project-agent.mjs"),
+      "--project", archive,
+      "--dependency-layer", failureLayer,
+      "--oj", failureOj,
+      "--mode", "both",
+      "--baseline-on-failure",
+      "--timeout-ms", "1000",
+      "--output-dir", failureOutput,
+    ], {
+      cwd: root,
+      encoding: "utf8",
+      timeout: 10_000,
+      env: {
+        ...process.env,
+        PROJECT_AGENT_INVOCATIONS: invocationOrder,
+        PROJECT_AGENT_BASELINE_STATUS: String(baselineStatus),
+      },
+    });
+    assert.notEqual(failed.status, 0, "synthetic OJ build failures must remain failures");
+    assert.deepEqual(fs.readFileSync(invocationOrder, "utf8").trim().split("\n"), expectedInvocations,
+      baselineStatus === 1
+        ? "build failures shared with Vite must not start an unnecessary OJ dev server"
+        : "OJ-only build failures must still evaluate the OJ dev server");
+    const checks = JSON.parse(fs.readFileSync(path.join(failureOutput, "report.json"), "utf8"))
+      .projects[0].checks;
+    assert.deepEqual(Object.keys(checks), expectedChecks);
+    assert.equal(checks.build.ok, false);
+    assert.equal(checks.baseline.ok, baselineStatus === 0);
+  }
+
   for (const [index, [message, dependency]] of [
     ['[vite]: Rollup failed to resolve import "@synthetic/rollup-package" from "/synthetic/main.ts"', "@synthetic/rollup-package"],
     ['[plugin:vite:import-analysis] Failed to resolve import "synthetic-vite-package" from "src/App.tsx"', "synthetic-vite-package"],
