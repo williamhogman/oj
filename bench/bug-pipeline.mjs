@@ -652,15 +652,33 @@ function publish(options) {
   const publicationRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bug-pipeline-publish-"));
   const checkout = path.join(publicationRoot, "checkout");
   let created = false;
+  let createdBranch = false;
   let pushed = false;
   let pullRequest;
   try {
-    git(options.repo, ["worktree", "add", "-b", branch, checkout, baseCommit]);
+    const existing = git(options.repo, ["show-ref", "--verify", `refs/heads/${branch}`], { allowFailure: true });
+    if (existing.status === 0) {
+      git(options.repo, ["worktree", "add", checkout, branch]);
+    } else {
+      git(options.repo, ["worktree", "add", "-b", branch, checkout, baseCommit]);
+      createdBranch = true;
+    }
     created = true;
-    git(checkout, ["cherry-pick", snapshot.testCommit]);
-    const testCommit = resolveCommit(checkout, "HEAD", "publication regression commit");
-    git(checkout, ["cherry-pick", `${snapshot.testCommit}..${snapshot.fixCommit}`]);
-    const fixCommit = resolveCommit(checkout, "HEAD", "publication fix commit");
+    let testCommit;
+    let fixCommit;
+    if (createdBranch) {
+      git(checkout, ["cherry-pick", snapshot.testCommit]);
+      testCommit = resolveCommit(checkout, "HEAD", "publication regression commit");
+      git(checkout, ["cherry-pick", `${snapshot.testCommit}..${snapshot.fixCommit}`]);
+      fixCommit = resolveCommit(checkout, "HEAD", "publication fix commit");
+    } else {
+      const commits = git(checkout, ["rev-list", "--reverse", `${baseCommit}..${branch}`]).stdout
+        .split("\n")
+        .filter(Boolean);
+      if (commits.length < 2) throw new Error("existing publication branch has no separate regression and fix");
+      testCommit = commits[0];
+      fixCommit = commits.at(-1);
+    }
     const task = { ...snapshot, branch, baseCommit };
     const report = verifyTask({
       ...options,
@@ -695,7 +713,7 @@ function publish(options) {
   } finally {
     if (created) {
       git(options.repo, ["worktree", "remove", "--force", checkout], { allowFailure: true });
-      if (!pushed) git(options.repo, ["branch", "-D", branch], { allowFailure: true });
+      if (createdBranch && !pushed) git(options.repo, ["branch", "-D", branch], { allowFailure: true });
     }
     fs.rmSync(publicationRoot, { recursive: true, force: true });
   }

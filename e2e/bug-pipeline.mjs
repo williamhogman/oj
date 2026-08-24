@@ -60,6 +60,11 @@ try {
   fs.writeFileSync(path.join(executables, "gh"), [
     "#!/usr/bin/env node",
     'import fs from "node:fs";',
+    'if (process.env.BUG_PIPELINE_GITHUB_FAILURE_MARKER && !fs.existsSync(process.env.BUG_PIPELINE_GITHUB_FAILURE_MARKER)) {',
+    '  fs.writeFileSync(process.env.BUG_PIPELINE_GITHUB_FAILURE_MARKER, "failed");',
+    '  process.stderr.write("synthetic transient GitHub failure\\n");',
+    '  process.exit(1);',
+    '}',
     'fs.appendFileSync(process.env.BUG_PIPELINE_GITHUB_CALLS, `${JSON.stringify(process.argv.slice(2))}\\n`);',
     'if (process.argv[2] !== "pr" || process.argv[3] !== "create") process.exit(2);',
     'process.stdout.write("https://github.com/synthetic-upstream/oj/pull/42\\n");',
@@ -263,6 +268,24 @@ try {
     run(["list"]).tasks.find((candidate) => candidate.id === task.id).pullRequest,
     undefined,
     "dry-run must not persist publication state",
+  );
+
+  const failureMarker = path.join(temporary, "github-failed-once");
+  const interruptedPublication = run([...publishOptions, "--draft"], {
+    failure: true,
+    env: { ...githubEnvironment, BUG_PIPELINE_GITHUB_FAILURE_MARKER: failureMarker },
+  });
+  assert.match(interruptedPublication.stderr, /transient GitHub failure/);
+  assert.equal(fs.existsSync(failureMarker), true);
+  assert.match(
+    command("git", ["for-each-ref", "--format=%(refname)", "refs/heads/bugfix/"], origin),
+    new RegExp(`${task.id}$`),
+    "the safely published branch must remain available after a transient GitHub failure",
+  );
+  assert.equal(
+    run(["list"]).tasks.find((candidate) => candidate.id === task.id).pullRequest,
+    undefined,
+    "failed pull request creation must not report a published pull request",
   );
 
   const publication = run([...publishOptions, "--draft"], { env: githubEnvironment });
