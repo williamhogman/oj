@@ -277,11 +277,59 @@ function runCommand(command, args, { cwd, timeout }) {
   };
 }
 
-function runBuild(project, directory, options) {
+function signalProcessTree(child, signal) {
+  if (!child.pid) return;
+  if (process.platform !== "win32") {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch {}
+  }
+  try { child.kill(signal); } catch {}
+}
+
+async function runManagedCommand(command, args, { cwd, timeout }) {
+  const started = performance.now();
+  return new Promise((resolve) => {
+    const child = spawn(command, args, {
+      cwd,
+      detached: process.platform !== "win32",
+      env: { ...process.env, NO_COLOR: "1", CI: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "", stderr = "", timedOut = false, finished = false, force;
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      signalProcessTree(child, "SIGTERM");
+      force = setTimeout(() => signalProcessTree(child, "SIGKILL"), 2_000);
+      force.unref();
+    }, timeout);
+    const finish = (status, signal, error) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(deadline);
+      if (force) clearTimeout(force);
+      resolve({
+        ok: status === 0 && !error && !timedOut,
+        status,
+        signal,
+        durationMs: Math.round(performance.now() - started),
+        output: [stdout, stderr, error?.message, timedOut ? `command timed out after ${timeout}ms` : ""]
+          .filter(Boolean).join("\n").trim(),
+      });
+    };
+    child.once("error", (error) => finish(null, null, error));
+    child.once("close", (status, signal) => finish(status, signal));
+  });
+}
+
+async function runBuild(project, directory, options) {
   const output = path.join(directory, ".oj-dist");
   const args = ["build", directory];
   if (project.kind !== "tanstack-start") args.push("--out", output);
-  const result = runCommand(options.oj, args, { cwd: ojRoot, timeout: options.timeoutMs });
+  const result = await runManagedCommand(options.oj, args, { cwd: ojRoot, timeout: options.timeoutMs });
   const outputDirectory = project.kind === "tanstack-start" ? path.join(directory, "dist") : output;
   if (result.ok && !fs.existsSync(outputDirectory)) {
     result.ok = false;
@@ -290,8 +338,8 @@ function runBuild(project, directory, options) {
   return result;
 }
 
-function runBaseline(directory, options) {
-  return runCommand(path.join(directory, "node_modules", ".bin", "vite"), ["build", "--outDir", path.join(directory, ".vite-dist")], {
+async function runBaseline(directory, options) {
+  return runManagedCommand(path.join(directory, "node_modules", ".bin", "vite"), ["build", "--outDir", path.join(directory, ".vite-dist")], {
     cwd: directory,
     timeout: options.timeoutMs,
   });
@@ -357,6 +405,7 @@ async function runDev(project, directory, options, baseline = false) {
     : ["dev", directory, "--port", String(port), "--host=127.0.0.1"];
   const child = spawn(executable, args, {
     cwd: baseline ? directory : ojRoot,
+    detached: process.platform !== "win32",
     env: { ...process.env, NO_COLOR: "1", CI: "1" },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -401,9 +450,15 @@ async function runDev(project, directory, options, baseline = false) {
       output: [error.message, output.trim()].filter(Boolean).join("\n"),
     };
   } finally {
-    child.kill("SIGTERM");
-    await Promise.race([new Promise((resolve) => child.once("exit", resolve)), delay(2_000)]);
-    if (child.exitCode === null) child.kill("SIGKILL");
+    let closed = false;
+    const closing = new Promise((resolve) => child.once("close", () => { closed = true; resolve(); }));
+    signalProcessTree(child, "SIGTERM");
+    await Promise.race([closing, delay(2_000)]);
+    if (!closed) {
+      signalProcessTree(child, "SIGKILL");
+      child.stdout.destroy();
+      child.stderr.destroy();
+    }
   }
 }
 
@@ -494,14 +549,14 @@ async function main() {
         result.checks.baseline = diagnose(
           options.baselineOnly && options.mode === "dev"
             ? await runDev(project, directory, options, true)
-            : runBaseline(directory, options),
+            : await runBaseline(directory, options),
         );
         const baseline = result.checks.baseline;
         console.log(`  ${baseline.ok ? "PASS" : "FAIL"} vite   ${baseline.durationMs}ms${baseline.ok ? "" : `  ${summarizeFailure(baseline.output)}`}`);
       }
 
       if (!options.baselineOnly && options.mode !== "dev") {
-        result.checks.build = diagnose(runBuild(project, directory, options));
+        result.checks.build = diagnose(await runBuild(project, directory, options));
         const build = result.checks.build;
         console.log(`  ${build.ok ? "PASS" : "FAIL"} build  ${build.durationMs}ms${build.ok ? "" : `  ${summarizeFailure(build.output)}`}`);
       }
@@ -513,7 +568,7 @@ async function main() {
       }
 
       if (options.baselineOnFailure && Object.values(result.checks).some((check) => !check.ok)) {
-        result.checks.baseline = diagnose(runBaseline(directory, options));
+        result.checks.baseline = diagnose(await runBaseline(directory, options));
         if (result.checks.baseline.ok && project.kind === "tanstack-start" &&
           result.checks.dev?.ok === false && result.checks.build?.ok !== false) {
           result.checks.baseline = diagnose(await runDev(project, directory, options, true));

@@ -91,6 +91,56 @@ try {
   assert.equal(JSON.parse(fs.readFileSync(path.join(baselineOutput, "report.json"), "utf8"))
     .projects[0].checks.baseline.ok, true);
 
+  if (process.platform !== "win32") {
+    const lingeringOj = path.join(temporary, "lingering-oj");
+    fs.writeFileSync(lingeringOj, [
+      "#!/usr/bin/env node",
+      'const { spawn } = require("node:child_process");',
+      'const fs = require("node:fs");',
+      'const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "inherit" });',
+      'fs.writeFileSync(process.env.PROJECT_AGENT_DESCENDANT_PID, String(descendant.pid));',
+      "setInterval(() => {}, 1000);",
+    ].join("\n") + "\n", { mode: 0o755 });
+
+    for (const mode of ["build", "dev"]) {
+      const descendantMarker = path.join(temporary, `${mode}-descendant-pid`);
+      const timeoutOutput = path.join(temporary, `${mode}-timeout-results`);
+      const started = performance.now();
+      const timed = spawnSync(process.execPath, [
+        path.join(root, "bench", "project-agent.mjs"),
+        "--project", archive,
+        "--dependency-layer", layer,
+        "--mode", mode,
+        "--oj", lingeringOj,
+        "--timeout-ms", "1000",
+        "--output-dir", timeoutOutput,
+      ], {
+        cwd: root,
+        encoding: "utf8",
+        timeout: 6_000,
+        killSignal: "SIGKILL",
+        env: { ...process.env, PROJECT_AGENT_DESCENDANT_PID: descendantMarker },
+      });
+      const elapsed = performance.now() - started;
+      const descendantPid = fs.existsSync(descendantMarker)
+        ? Number(fs.readFileSync(descendantMarker, "utf8"))
+        : undefined;
+
+      try {
+        assert.equal(timed.error, undefined, `${mode} timeout must not wait for inherited descendant pipes`);
+        assert.ok(elapsed < 5_000, `${mode} timeout exceeded its bounded cleanup window: ${elapsed}ms`);
+        assert.ok(Number.isSafeInteger(descendantPid), `${mode} fixture must start a descendant:\n${timed.stdout}\n${timed.stderr}`);
+        assert.throws(() => process.kill(descendantPid, 0), `${mode} timeout must terminate its full process group`);
+        const result = JSON.parse(fs.readFileSync(path.join(timeoutOutput, "report.json"), "utf8"));
+        assert.equal(result.projects[0].checks[mode].diagnostic.kind, "timeout");
+      } finally {
+        if (descendantPid) {
+          try { process.kill(descendantPid, "SIGKILL"); } catch {}
+        }
+      }
+    }
+  }
+
   const missingArchive = path.join(temporary, "missing-dependency.zip");
   const missingOutput = path.join(temporary, "missing-results");
   fs.writeFileSync(path.join(project, "main.js"), 'import "missing-agent-dependency";\n');
