@@ -14,6 +14,10 @@ const repository = path.join(temporary, "repository");
 const state = path.join(temporary, "state", "queue.json");
 const worktrees = path.join(temporary, "worktrees");
 const clusters = path.join(temporary, "clusters.json");
+const origin = path.join(temporary, "origin.git");
+const upstream = path.join(temporary, "upstream.git");
+const executables = path.join(temporary, "executables");
+const githubCalls = path.join(temporary, "github-calls.jsonl");
 
 function command(executable, arguments_, cwd = repository) {
   const result = spawnSync(executable, arguments_, { cwd, encoding: "utf8" });
@@ -21,10 +25,11 @@ function command(executable, arguments_, cwd = repository) {
   return result.stdout.trim();
 }
 
-function run(arguments_, { failure = false } = {}) {
+function run(arguments_, { failure = false, env = {} } = {}) {
   const result = spawnSync(process.execPath, [pipeline, ...arguments_, "--state", state, "--repo", repository], {
     cwd: repository,
     encoding: "utf8",
+    env: { ...process.env, ...env },
   });
   if (failure) {
     assert.notEqual(result.status, 0, `command unexpectedly succeeded:\n${result.stdout}`);
@@ -42,7 +47,28 @@ try {
   fs.writeFileSync(path.join(repository, "value.mjs"), "export const value = 1;\n");
   command("git", ["add", "value.mjs"]);
   command("git", ["commit", "-q", "-m", "initial implementation"]);
+  command("git", ["branch", "-M", "main"]);
   const initial = command("git", ["rev-parse", "HEAD"]);
+  command("git", ["init", "--bare", "-q", origin]);
+  command("git", ["init", "--bare", "-q", upstream]);
+  command("git", ["remote", "add", "origin", origin]);
+  command("git", ["remote", "add", "upstream", upstream]);
+  command("git", ["push", "-q", "origin", "main"]);
+  command("git", ["push", "-q", "upstream", "main"]);
+
+  fs.mkdirSync(executables);
+  fs.writeFileSync(path.join(executables, "gh"), [
+    "#!/usr/bin/env node",
+    'import fs from "node:fs";',
+    'fs.appendFileSync(process.env.BUG_PIPELINE_GITHUB_CALLS, `${JSON.stringify(process.argv.slice(2))}\\n`);',
+    'if (process.argv[2] !== "pr" || process.argv[3] !== "create") process.exit(2);',
+    'process.stdout.write("https://github.com/synthetic-upstream/oj/pull/42\\n");',
+    "",
+  ].join("\n"), { mode: 0o755 });
+  const githubEnvironment = {
+    PATH: `${executables}${path.delimiter}${process.env.PATH}`,
+    BUG_PIPELINE_GITHUB_CALLS: githubCalls,
+  };
 
   const restricted = "restricted-company-token";
   const upstreamFingerprint = "0123456789abcdef0123456789abcdef";
@@ -93,6 +119,12 @@ try {
   assert.equal(task.affectedCount, 17);
   assert.equal(fs.existsSync(task.worktree), true);
   assert.equal(command("git", ["rev-parse", "--abbrev-ref", "HEAD"], task.worktree), task.branch);
+
+  const prematurelyPublished = run([
+    "publish", "--id", task.id, "--github-repo", "synthetic-upstream/oj", "--head-owner", "synthetic-owner",
+  ], { failure: true, env: githubEnvironment });
+  assert.match(prematurelyPublished.stderr, /not completed/);
+  assert.equal(fs.existsSync(githubCalls), false, "unverified tasks must never reach GitHub");
 
   const wrongWorker = run(["release", "--id", task.id, "--worker", "worker-2"], { failure: true });
   assert.match(wrongWorker.stderr, /another worker/);
@@ -186,6 +218,104 @@ try {
     "--test-command", "node tests/bad.test.mjs",
   ], { failure: true });
   assert.match(mixed.stderr, /test-only commit/);
+
+  fs.writeFileSync(path.join(repository, "upstream-only.mjs"), "export const upstreamOnly = true;\n");
+  command("git", ["add", "upstream-only.mjs"]);
+  command("git", ["commit", "-q", "-m", "advance upstream independently"]);
+  command("git", ["push", "-q", "upstream", "main"]);
+  command("git", ["fetch", "-q", "upstream", "main"]);
+  const latestUpstream = command("git", ["rev-parse", "upstream/main"]);
+  assert.notEqual(latestUpstream, initial);
+
+  const publishOptions = [
+    "publish", "--id", task.id,
+    "--github-repo", "synthetic-upstream/oj",
+    "--head-owner", "synthetic-owner",
+  ];
+
+  const missingGithubRepository = run([
+    "publish", "--id", task.id, "--head-owner", "synthetic-owner",
+  ], { failure: true, env: githubEnvironment });
+  assert.match(missingGithubRepository.stderr, /--github-repo/);
+
+  const invalidGithubRepository = run([
+    "publish", "--id", task.id, "--github-repo", "synthetic-upstream/oj --unsafe",
+  ], { failure: true, env: githubEnvironment });
+  assert.match(invalidGithubRepository.stderr, /github.repo|repository|owner/i);
+
+  const deniedPublication = run([...publishOptions, "--deny", "export const"], {
+    failure: true,
+    env: githubEnvironment,
+  });
+  assert.match(deniedPublication.stderr, /privacy screening/);
+  assert.equal(fs.existsSync(githubCalls), false, "unsafe changes must never reach GitHub");
+
+  const previewPublication = run([...publishOptions, "--dry-run"], { env: githubEnvironment });
+  assert.equal(previewPublication.action, "publish");
+  assert.equal(previewPublication.dryRun, true);
+  assert.equal(fs.existsSync(githubCalls), false, "dry-run must not create a pull request");
+  assert.equal(
+    command("git", ["for-each-ref", "--format=%(refname)", "refs/heads/bugfix/"], origin),
+    "",
+    "dry-run must not push a public branch",
+  );
+  assert.equal(
+    run(["list"]).tasks.find((candidate) => candidate.id === task.id).pullRequest,
+    undefined,
+    "dry-run must not persist publication state",
+  );
+
+  const publication = run([...publishOptions, "--draft"], { env: githubEnvironment });
+  assert.equal(publication.action, "publish");
+  const publishedTask = run(["list"]).tasks.find((candidate) => candidate.id === task.id);
+  assert.equal(publishedTask.status, "completed");
+  assert.equal(publishedTask.pullRequest.url, "https://github.com/synthetic-upstream/oj/pull/42");
+  assert.equal(publishedTask.pullRequest.branch, `bugfix/${task.id}`);
+  assert.equal(publishedTask.pullRequest.base, "main");
+
+  const calls = fs.readFileSync(githubCalls, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(calls.length, 1, "one verified bug must create exactly one pull request");
+  const [call] = calls;
+  assert.deepEqual(call.slice(0, 2), ["pr", "create"]);
+  for (const [flag, expected] of [
+    ["--repo", "synthetic-upstream/oj"],
+    ["--head", `synthetic-owner:bugfix/${task.id}`],
+    ["--base", "main"],
+  ]) {
+    const index = call.indexOf(flag);
+    assert.notEqual(index, -1, `${flag} must be passed to GitHub`);
+    assert.equal(call[index + 1], expected);
+  }
+  assert.equal(call.includes("--draft"), true);
+  const body = call[call.indexOf("--body") + 1];
+  assert.match(body, /fail/i, "pull requests must describe the failing regression");
+  assert.match(body, /pass/i, "pull requests must describe the passing fix");
+  assert.equal(body.includes(restricted), false, "pull requests must not contain restricted input");
+  assert.equal(body.includes("external-customer-identifier"), false, "pull requests must not identify projects");
+  assert.equal(body.includes("customer@example.invalid"), false, "pull requests must not contain customer details");
+  assert.equal(body.includes("example.invalid/customer"), false, "pull requests must not contain customer URLs");
+
+  const remoteBranch = `refs/heads/bugfix/${task.id}`;
+  const publishedTip = command("git", ["rev-parse", remoteBranch], origin);
+  assert.equal(command("git", ["merge-base", publishedTip, latestUpstream]), latestUpstream);
+  assert.equal(
+    command("git", ["rev-list", "--count", `${latestUpstream}..${publishedTip}`]),
+    "2",
+    "each public branch must contain only its regression and implementation commits",
+  );
+  assert.deepEqual(
+    command("git", ["log", "--format=%s", "--reverse", `${latestUpstream}..${publishedTip}`]).split("\n"),
+    ["test: reproduce incorrect value", "fix: return the expected value"],
+  );
+  assert.deepEqual(
+    command("git", ["diff", "--name-only", latestUpstream, publishedTip]).split("\n").sort(),
+    ["tests/regression.test.mjs", "value.mjs"],
+    "the pull request must not include tooling, unrelated bugs, or upstream-only changes",
+  );
+
+  const repeatedPublication = run(publishOptions, { env: githubEnvironment });
+  assert.equal(repeatedPublication.action, "publish");
+  assert.equal(fs.readFileSync(githubCalls, "utf8").trim().split("\n").length, 1);
 
   console.log("BUG-PIPELINE E2E PASSED");
 } finally {
