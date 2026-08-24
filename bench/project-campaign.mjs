@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -330,9 +330,30 @@ function invokeAgent(archive, options, baseline) {
       if (finished) return;
       finished = true;
       clearTimeout(deadline);
-      const parsed = readWorkerReport(report);
-      fs.rmSync(temporary, { recursive: true, force: true });
-      resolve({ status, timeout, report: parsed, error: error?.message, output });
+      let parsed = readWorkerReport(report);
+      let cleanupError;
+      try {
+        fs.rmSync(temporary, { recursive: true, force: true });
+      } catch (failure) {
+        cleanupError = failure;
+        if (options.sandbox) {
+          const recovered = spawnSync("sudo", ["-n", process.execPath, options.sandbox, "--cleanup-output", temporary], {
+            stdio: "ignore",
+            timeout: 10_000,
+          });
+          if (recovered.status === 0) {
+            try {
+              parsed ??= readWorkerReport(report);
+              fs.rmSync(temporary, { recursive: true, force: true });
+              cleanupError = undefined;
+            } catch (retryFailure) {
+              cleanupError = retryFailure;
+            }
+          }
+        }
+      }
+      resolve({ status, timeout, report: cleanupError ? undefined : parsed,
+        error: error?.message ?? cleanupError?.message, output });
     };
 
     child.once("error", (error) => finish(null, error));

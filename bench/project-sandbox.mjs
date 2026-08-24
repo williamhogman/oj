@@ -44,6 +44,55 @@ function value(index, flag) {
   return result;
 }
 
+function reclaimWorkerOutput(filename) {
+  if (process.platform !== "linux" || process.getuid?.() !== 0) {
+    throw new Error("worker output recovery requires a privileged Linux supervisor");
+  }
+  const uid = Number(process.env.SUDO_UID);
+  const gid = Number(process.env.SUDO_GID);
+  if (!Number.isSafeInteger(uid) || uid < 1 || !Number.isSafeInteger(gid) || gid < 1) {
+    throw new Error("worker output recovery requires an unprivileged invoking owner");
+  }
+  const directory = path.resolve(filename);
+  const parent = fs.realpathSync(path.dirname(directory));
+  const roots = [os.tmpdir(), "/var/tmp"].map((candidate) => fs.realpathSync(candidate));
+  if (!roots.includes(parent) || !/^oj-campaign-worker-[a-zA-Z0-9]{6}$/.test(path.basename(directory))) {
+    throw new Error("worker output recovery requires a dedicated temporary worker directory");
+  }
+  const original = fs.lstatSync(directory);
+  if (!original.isDirectory() || (original.uid !== uid && original.uid !== options.uid)) {
+    throw new Error("worker output recovery requires an isolated worker-owned directory");
+  }
+
+  function reclaim(current) {
+    const descriptor = fs.openSync(current, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    try {
+      fs.fchownSync(descriptor, uid, gid);
+      fs.fchmodSync(descriptor, 0o700);
+      for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+        const child = path.join(current, entry.name);
+        if (entry.isDirectory()) reclaim(child);
+        else fs.lchownSync(child, uid, gid);
+      }
+    } finally {
+      fs.closeSync(descriptor);
+    }
+  }
+
+  reclaim(directory);
+}
+
+if (process.argv[2] === "--cleanup-output") {
+  try {
+    if (process.argv.length !== 4) throw new Error("worker output recovery requires exactly one directory");
+    reclaimWorkerOutput(process.argv[3]);
+    process.exit(0);
+  } catch (error) {
+    console.error(error.message);
+    process.exit(1);
+  }
+}
+
 for (let index = 2; index < process.argv.length; index += 1) {
   const argument = process.argv[index];
   if (argument === "--help" || argument === "-h") {

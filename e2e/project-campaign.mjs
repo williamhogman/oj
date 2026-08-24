@@ -243,6 +243,12 @@ try {
     'import fs from "node:fs";',
     'import path from "node:path";',
     "const args = process.argv.slice(2);",
+    'if (args[0] === "--cleanup-output") {',
+    '  const directory = args[1];',
+    '  fs.appendFileSync(process.env.CAMPAIGN_CLEANUP_MARKER, `${directory}\\n`);',
+    '  fs.chmodSync(directory, 0o700);',
+    '  process.exit(0);',
+    "}",
     'const archive = args[args.indexOf("--archive") + 1];',
     'const dependencies = args[args.indexOf("--dependencies") + 1];',
     'const output = args[args.indexOf("--output") + 1];',
@@ -257,6 +263,10 @@ try {
     "}",
     'if (process.env.CAMPAIGN_SANDBOX_OVERSIZED) {',
     '  fs.writeFileSync(path.join(output, "report.json"), "x".repeat(4 * 1024 * 1024 + 1));',
+    "}",
+    'if (process.env.CAMPAIGN_SANDBOX_INACCESSIBLE) {',
+    '  fs.symlinkSync(process.env.CAMPAIGN_SANDBOX_INACCESSIBLE, path.join(output, "external"));',
+    '  fs.chmodSync(output, 0);',
     "}",
     "process.exit(result.status ?? 1);",
   ].join("\n") + "\n");
@@ -331,6 +341,41 @@ try {
   assert.equal(oversized.status, 0, `oversized report campaign failed:\n${oversized.stdout}\n${oversized.stderr}`);
   assert.equal(JSON.parse(fs.readFileSync(path.join(oversizedOutput, "summary.json"), "utf8")).infrastructureFailures, 1,
     "oversized worker reports must be rejected before parsing");
+
+  const cleanupMarker = path.join(temporary, "cleanup-marker");
+  const cleanupSentinel = path.join(temporary, "cleanup-sentinel");
+  const cleanupOutput = path.join(temporary, "cleanup-results");
+  fs.writeFileSync(cleanupSentinel, "external data must stay untouched");
+  const inaccessible = spawnSync(process.execPath, [
+    campaign,
+    "--manifest", manifest,
+    "--dependency-layer", layer,
+    "--output-dir", cleanupOutput,
+    "--mode", "build",
+    "--retries", "0",
+    "--sandbox-command", sandbox,
+    "--require-isolation",
+  ], {
+    cwd: root,
+    encoding: "utf8",
+    timeout: 30_000,
+    env: {
+      ...process.env,
+      PATH: `${shimDirectory}${path.delimiter}${process.env.PATH}`,
+      CAMPAIGN_TEST_ROOT: root,
+      CAMPAIGN_CLEANUP_MARKER: cleanupMarker,
+      CAMPAIGN_SANDBOX_INACCESSIBLE: cleanupSentinel,
+    },
+  });
+  assert.equal(inaccessible.status, 0,
+    `inaccessible worker output must not crash the campaign:\n${inaccessible.stdout}\n${inaccessible.stderr}`);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(cleanupOutput, "summary.json"), "utf8")).passed, 1,
+    "recoverable worker reports must remain usable after output ownership is restored");
+  const recoveredDirectory = fs.readFileSync(cleanupMarker, "utf8").trim();
+  assert.match(path.basename(recoveredDirectory), /^oj-campaign-worker-/);
+  assert.equal(fs.existsSync(recoveredDirectory), false, "privileged recovery must remove inaccessible worker output");
+  assert.equal(fs.readFileSync(cleanupSentinel, "utf8"), "external data must stay untouched",
+    "worker output cleanup must not follow symbolic links");
 
   console.log("PROJECT-CAMPAIGN E2E PASSED");
 } finally {
