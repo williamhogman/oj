@@ -7,8 +7,8 @@ import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 
 export const EXTS = [
-  ".ts", ".tsx", ".js", ".jsx", ".mjs",
-  "/index.ts", "/index.tsx", "/index.js", "/index.jsx", "/index.mjs",
+  ".ts", ".tsx", ".js", ".jsx", ".mjs", ".json",
+  "/index.ts", "/index.tsx", "/index.js", "/index.jsx", "/index.mjs", "/index.json",
 ];
 
 export const isFile = (p) => {
@@ -32,7 +32,7 @@ export function probe(base) {
 export const RESERVED = new Set(
   ("break case catch class const continue debugger default delete do else enum export extends false finally " +
     "for function if import in instanceof new null return super switch this throw true try typeof var void " +
-    "while with yield let static await").split(" "),
+    "while with yield let static await implements interface package private protected public arguments eval").split(" "),
 );
 
 const pkgTypeCache = new Map();
@@ -97,6 +97,9 @@ export function stripJsonc(s) {
     if (c === '"' || c === "'") { inStr = true; q = c; out += c; i++; continue; }
     if (c === "/" && n === "/") { while (i < s.length && s[i] !== "\n") i++; continue; }
     if (c === "/" && n === "*") { i += 2; while (i < s.length && !(s[i] === "*" && s[i + 1] === "/")) i++; i += 2; continue; }
+    if (c === "," && /^(?:\s|\/\/[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*[}\]]/.test(s.slice(i + 1))) {
+      i++; continue;
+    }
     out += c; i++;
   }
   return out;
@@ -104,18 +107,27 @@ export function stripJsonc(s) {
 
 export function readJsonc(file) {
   try {
-    return JSON.parse(stripJsonc(readFileSync(file, "utf8")).replace(/,(\s*[}\]])/g, "$1"));
+    return JSON.parse(stripJsonc(readFileSync(file, "utf8")).replace(/^\ufeff/, ""));
   } catch {
     return null;
   }
 }
 
 export function parseImportsField(imports = {}) {
+  const targetOf = (target) => {
+    if (typeof target === "string") return target;
+    if (Array.isArray(target)) {
+      for (const entry of target) {
+        const resolved = targetOf(entry);
+        if (resolved) return resolved;
+      }
+      return null;
+    }
+    if (!target || typeof target !== "object") return null;
+    return targetOf(target.import) ?? targetOf(target.default) ?? targetOf(target.node);
+  };
   return Object.entries(imports)
-    .map(([pattern, target]) => [
-      pattern,
-      typeof target === "string" ? target : target?.import ?? target?.default ?? target?.node,
-    ])
+    .map(([pattern, target]) => [pattern, targetOf(target)])
     .filter(([, t]) => typeof t === "string");
 }
 

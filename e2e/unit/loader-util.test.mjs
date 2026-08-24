@@ -30,6 +30,20 @@ test("probe finds an exact file, else a .ts for a .js import, else an index", ()
   }
 });
 
+test("probe resolves extensionless JSON modules and directory indexes", () => {
+  const dir = mk("json-probe");
+  try {
+    mkdirSync(join(dir, "config"), { recursive: true });
+    writeFileSync(join(dir, "settings.json"), "{}");
+    writeFileSync(join(dir, "config", "index.json"), "{}");
+
+    assert.equal(probe(join(dir, "settings")), join(dir, "settings.json"));
+    assert.equal(probe(join(dir, "config")), join(dir, "config", "index.json"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("hasEsmSyntax detects import/export at statement position", () => {
   assert.ok(hasEsmSyntax(fileWith("export const x = 1;")));
   assert.ok(hasEsmSyntax(fileWith("import x from 'y';")));
@@ -111,6 +125,20 @@ test("cjsFacade unwraps default for __esModule (transpiled ESM) modules", () => 
   }
 });
 
+test("cjsFacade omits strict-mode reserved identifiers from named exports", () => {
+  const dir = mk("facade-reserved");
+  try {
+    const file = join(dir, "legacy.cjs");
+    writeFileSync(file, "module.exports = { interface: 1, implements: 2, private: 3, valid: 4 };");
+
+    const facade = cjsFacade(file);
+    assert.match(facade, /export const valid =/);
+    assert.doesNotMatch(facade, /export const (?:interface|implements|private) =/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("parseImportsField flattens string and conditional-object targets", () => {
   const rules = parseImportsField({
     "#lib/*": "./src/lib/*",
@@ -130,6 +158,18 @@ test("parseImportsField flattens string and conditional-object targets", () => {
 test("parseImportsField tolerates an empty/absent map", () => {
   assert.deepEqual(parseImportsField(), []);
   assert.deepEqual(parseImportsField({}), []);
+});
+
+test("parseImportsField resolves fallback arrays and nested import conditions", () => {
+  const rules = Object.fromEntries(parseImportsField({
+    "#fallback": [null, "./src/fallback.ts"],
+    "#nested": { import: { default: "./src/nested.ts" } },
+    "#array-condition": [{ require: "./ignored.cjs" }, { import: "./src/module.ts" }],
+  }));
+
+  assert.equal(rules["#fallback"], "./src/fallback.ts");
+  assert.equal(rules["#nested"], "./src/nested.ts");
+  assert.equal(rules["#array-condition"], "./src/module.ts");
 });
 
 test("mergeTsConfig merges paths across an extends chain, later wins", () => {
@@ -239,6 +279,32 @@ test("stripJsonc + readJsonc tolerate comments and trailing commas", () => {
     assert.deepEqual(cfg.compilerOptions.paths, { "@/*": ["./src/*"] });
     assert.ok(stripJsonc('{"u":"a//b"}').includes("a//b"));
     assert.equal(readJsonc(join(dir, "nope.json")), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("readJsonc preserves comma-and-bracket sequences inside string values", () => {
+  const dir = mk("jsonc-string");
+  try {
+    const file = join(dir, "tsconfig.json");
+    writeFileSync(file, '{"compilerOptions":{"custom":"literal,} and ,]",},}');
+
+    assert.deepEqual(readJsonc(file), {
+      compilerOptions: { custom: "literal,} and ,]" },
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("readJsonc accepts TypeScript configuration with a UTF-8 byte-order mark", () => {
+  const dir = mk("jsonc-bom");
+  try {
+    const file = join(dir, "tsconfig.json");
+    writeFileSync(file, '\ufeff{"compilerOptions":{"baseUrl":"./src"}}');
+
+    assert.deepEqual(readJsonc(file), { compilerOptions: { baseUrl: "./src" } });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

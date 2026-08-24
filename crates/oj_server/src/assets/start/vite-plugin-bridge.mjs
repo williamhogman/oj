@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 process.env.VITE_CONFIG_NATIVE_IGNORE_WARNING ??= "true";
 
 const CONFIG_FILES = [
-  "vite.config.ts", "vite.config.js", "vite.config.mjs", "vite.config.mts",
+  "vite.config.ts", "vite.config.js", "vite.config.mjs", "vite.config.mts", "vite.config.cjs", "vite.config.cts",
   "oj.config.ts", "oj.config.js", "oj.config.mjs",
 ];
 
@@ -40,7 +40,10 @@ function envAllows(plugin, environment) {
 }
 
 function matchOne(pat, id) {
-  if (pat instanceof RegExp) return pat.test(id);
+  if (pat instanceof RegExp) {
+    pat.lastIndex = 0;
+    return pat.test(id);
+  }
   if (typeof pat === "string") return id.includes(pat);
   return false;
 }
@@ -116,6 +119,10 @@ export function createPluginContainer(vite, allPlugins, {
       (p) => (p.buildStart || p.resolveId || p.load || p.transform || p.generateBundle) && applyMatches(p, command, mode),
     ),
   );
+  const transformPlugins = [...plugins].sort((a, b) => {
+    const rank = (hook) => hook?.order === "pre" ? -1 : hook?.order === "post" ? 1 : 0;
+    return rank(a.transform) - rank(b.transform);
+  });
 
   const parse = typeof vite?.parseAst === "function"
     ? (code, opts) => vite.parseAst(code, opts)
@@ -146,13 +153,25 @@ export function createPluginContainer(vite, allPlugins, {
     parse,
   };
 
-  async function resolveId(id, importer) {
+  function pluginContext(plugin, base = ctx) {
+    return Object.assign(Object.create(base), {
+      async resolve(source, importer, options = {}) {
+        const resolved = await resolveId(source, importer, options.skipSelf === false ? undefined : plugin);
+        return resolved == null ? null : { id: resolved };
+      },
+    });
+  }
+
+  async function resolveId(id, importer, skippedPlugin) {
     for (const p of plugins) {
+      if (p === skippedPlugin) continue;
       if (!envAllows(p, environment)) continue;
       const h = hookHandler(p.resolveId);
       if (!h || !idAllowed(hookFilter(p.resolveId), id)) continue;
       let r;
-      try { r = await h.call(ctx, id, importer, { isEntry: false, ssr: environment === "ssr" }); } catch { continue; }
+      try {
+        r = await h.call(pluginContext(p), id, importer, { isEntry: false, ssr: environment === "ssr" });
+      } catch { continue; }
       if (r != null) return typeof r === "string" ? r : r.id;
     }
     return null;
@@ -164,7 +183,7 @@ export function createPluginContainer(vite, allPlugins, {
       const h = hookHandler(p.load);
       if (!h || !idAllowed(hookFilter(p.load), id)) continue;
       let r;
-      try { r = await h.call(ctx, id, { ssr: environment === "ssr" }); } catch { continue; }
+      try { r = await h.call(pluginContext(p), id, { ssr: environment === "ssr" }); } catch { continue; }
       if (r != null) return typeof r === "string" ? r : r.code;
     }
     return null;
@@ -172,12 +191,13 @@ export function createPluginContainer(vite, allPlugins, {
 
   async function transform(code, id) {
     let current = code, changed = false;
-    for (const p of plugins) {
+    for (const p of transformPlugins) {
       if (!envAllows(p, environment)) continue;
       const h = hookHandler(p.transform);
-      if (!h || !idAllowed(hookFilter(p.transform), id)) continue;
+      const filter = hookFilter(p.transform);
+      if (!h || !idAllowed(filter, id) || !idAllowed(filter?.code, current)) continue;
       let r;
-      try { r = await h.call(ctx, current, id); } catch { continue; }
+      try { r = await h.call(pluginContext(p), current, id, { ssr: environment === "ssr" }); } catch { continue; }
       const next = r == null ? null : typeof r === "string" ? r : r.code;
       if (next != null) { current = next; changed = true; }
     }
@@ -187,12 +207,13 @@ export function createPluginContainer(vite, allPlugins, {
   async function transformUserCode(code, id) {
     const ssr = environment === "ssr";
     let current = code, changed = false;
-    for (const p of plugins) {
+    for (const p of transformPlugins) {
       if (ojReimplemented(p.name) || !envAllows(p, environment)) continue;
       const h = hookHandler(p.transform);
-      if (!h || !idAllowed(hookFilter(p.transform), id)) continue;
+      const filter = hookFilter(p.transform);
+      if (!h || !idAllowed(filter, id) || !idAllowed(filter?.code, current)) continue;
       let r;
-      try { r = await h.call(ctx, current, id, { ssr }); } catch { continue; }
+      try { r = await h.call(pluginContext(p), current, id, { ssr }); } catch { continue; }
       const next = r == null ? null : typeof r === "string" ? r : r.code;
       if (next != null) { current = next; changed = true; }
     }
@@ -204,7 +225,7 @@ export function createPluginContainer(vite, allPlugins, {
     for (const p of plugins) {
       const h = hookHandler(p.generateBundle);
       if (!h || !envAllows(p, environment)) continue;
-      try { await h.call(genCtx, { format: "es" }, {}, false); } catch {}
+      try { await h.call(pluginContext(p, genCtx), { format: "es" }, {}, false); } catch {}
     }
   }
 
@@ -232,7 +253,7 @@ export function createPluginContainer(vite, allPlugins, {
         let timer;
         try {
           await Promise.race([
-            h.call(ctx, {}),
+            h.call(pluginContext(p), {}),
             new Promise((_, reject) => {
               timer = setTimeout(() => reject(new Error(`timed out after ${buildStartTimeoutMs}ms`)), buildStartTimeoutMs);
             }),
@@ -264,7 +285,9 @@ export async function loadPluginContainer(app, opts = {}) {
   }
   const all = (loaded?.config?.plugins ?? []).flat(Infinity).filter(Boolean);
   const container = createPluginContainer(vite, all, opts);
-  const publicDir = typeof loaded?.config?.publicDir === "string" ? loaded.config.publicDir : null;
+  const publicDir = loaded?.config?.publicDir === false
+    ? false
+    : typeof loaded?.config?.publicDir === "string" ? loaded.config.publicDir : null;
   const configDependencies = [configFile, ...(loaded?.dependencies ?? [])];
   return { ...container, publicDir, configDependencies };
 }

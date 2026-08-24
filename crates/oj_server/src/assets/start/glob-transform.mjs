@@ -48,9 +48,17 @@ function matchPattern(fileDir, pattern) {
   const starIdx = absGlob.search(/[*?{]/);
   const base = starIdx === -1 ? dirname(absGlob) : absGlob.slice(0, absGlob.lastIndexOf("/", starIdx));
   const re = globToRegExp(absGlob);
+  const explicitHidden = absGlob.slice(base.length + 1).split("/")
+    .filter((part) => part.startsWith("."))
+    .map(globToRegExp);
   const all = [];
   walk(base.split("/").join(sep), all);
-  return all.filter((f) => re.test(f.split(sep).join("/")));
+  return all.filter((f) => {
+    const normalized = f.split(sep).join("/");
+    if (!re.test(normalized)) return false;
+    return normalized.slice(base.length + 1).split("/")
+      .every((part) => !part.startsWith(".") || explicitHidden.some((pattern) => pattern.test(part)));
+  });
 }
 
 const toRel = (fileDir, abs) => {
@@ -85,8 +93,13 @@ export function transformGlob(code, filePath) {
     const files = [...new Set(includes.flatMap((p) => matchPattern(fileDir, p)))]
       .filter((f) => !exclude.has(f))
       .sort();
-    const query = typeof opts.query === "string" ? opts.query : "";
-    const wantDefault = opts.import === "default";
+    const query = typeof opts.query === "string"
+      ? opts.query
+      : opts.query && typeof opts.query === "object"
+        ? `?${new URLSearchParams(opts.query)}`
+        : "";
+    const importName = typeof opts.import === "string" ? opts.import : null;
+    const wantDefault = importName === "default";
     const entries = files.map((f, idx) => {
       const rel = toRel(fileDir, f);
       const spec = rel + query;
@@ -95,12 +108,16 @@ export function transformGlob(code, filePath) {
         const id = `__oj_glob${g}_${idx}`;
         prelude.push(wantDefault
           ? `import ${id} from ${JSON.stringify(spec)};`
-          : `import * as ${id} from ${JSON.stringify(spec)};`);
+          : importName
+            ? `import { ${importName} as ${id} } from ${JSON.stringify(spec)};`
+            : `import * as ${id} from ${JSON.stringify(spec)};`);
         return `${key}: ${id}`;
       }
       const imp = wantDefault
         ? `() => import(${JSON.stringify(spec)}).then((m) => m.default)`
-        : `() => import(${JSON.stringify(spec)})`;
+        : importName
+          ? `() => import(${JSON.stringify(spec)}).then((m) => m[${JSON.stringify(importName)}])`
+          : `() => import(${JSON.stringify(spec)})`;
       return `${key}: ${imp}`;
     });
     out += code.slice(last, m.index) + `{${entries.join(", ")}}`;

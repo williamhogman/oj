@@ -2,7 +2,12 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { __test, createPluginContainer } from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  __test, createPluginContainer, findConfig, loadPluginContainer,
+} from "../../crates/oj_server/src/assets/start/vite-plugin-bridge.mjs";
 
 const { matchOne, idAllowed, applyMatches, ordered, hookHandler, hookFilter, ojReimplemented, envAllows } = __test;
 
@@ -11,6 +16,29 @@ test("matchOne: RegExp tests, string is a substring match", () => {
   assert.ok(!matchOne(/\.mdx$/, "/a/b.tsx"));
   assert.ok(matchOne("virtual:", "virtual:foo"));
   assert.ok(!matchOne("virtual:", "./real"));
+});
+
+test("global and sticky expression filters match consistently across modules", () => {
+  const global = /\.tsx$/g;
+  const sticky = /component/y;
+
+  assert.ok(matchOne(global, "/src/first.tsx"));
+  assert.ok(matchOne(global, "/src/second.tsx"));
+  assert.ok(matchOne(sticky, "component-one"));
+  assert.ok(matchOne(sticky, "component-two"));
+});
+
+test("findConfig discovers CommonJS Vite configuration formats", () => {
+  for (const name of ["vite.config.cjs", "vite.config.cts"]) {
+    const root = mkdtempSync(join(tmpdir(), "oj-config-format-"));
+    try {
+      const config = join(root, name);
+      writeFileSync(config, "module.exports = {};\n");
+      assert.equal(findConfig(root), config);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
 });
 
 test("idAllowed: no filter allows everything", () => {
@@ -176,4 +204,104 @@ test("resolveId and load receive Vite SSR hook options", async () => {
   assert.equal(await server.load("\0server:virtual:entry"), 'export default "server";');
   assert.equal(await client.resolveId("virtual:entry", "/app.ts"), "\0client:virtual:entry");
   assert.equal(await client.load("\0client:virtual:entry"), 'export default "client";');
+});
+
+test("transform hook code filters gate both transform entry points", async () => {
+  const plugin = {
+    name: "synthetic-selective-transform",
+    transform: {
+      filter: { id: /\.tsx$/, code: { include: /@enabled/, exclude: /@disabled/ } },
+      handler(code) { return `${code}\ntransformed();`; },
+    },
+  };
+  const container = createPluginContainer({}, [plugin]);
+
+  assert.equal(await container.transform("plain();", "/app.tsx"), null);
+  assert.equal(await container.transform("/* @enabled @disabled */", "/app.tsx"), null);
+  assert.equal(await container.transform("/* @enabled */", "/app.tsx"), "/* @enabled */\ntransformed();");
+  assert.equal(await container.transformUserCode("plain();", "/app.tsx"), null);
+  assert.equal(await container.transformUserCode("/* @enabled */", "/app.tsx"), "/* @enabled */\ntransformed();");
+});
+
+test("transform hooks honor per-hook pre and post ordering", async () => {
+  const plugin = (name, order) => ({
+    name,
+    transform: {
+      ...(order ? { order } : {}),
+      handler(code) { return `${code}${name};`; },
+    },
+  });
+  const container = createPluginContainer({}, [
+    plugin("post", "post"),
+    plugin("normal"),
+    plugin("pre", "pre"),
+  ]);
+
+  assert.equal(await container.transform("", "/app.ts"), "pre;normal;post;");
+  assert.equal(await container.transformUserCode("", "/app.ts"), "pre;normal;post;");
+});
+
+test("transform hooks receive the active SSR environment option", async () => {
+  const plugin = {
+    name: "synthetic-environment-transform",
+    transform(_code, _id, options) {
+      return `export default ${JSON.stringify(options?.ssr ? "server" : "client")};`;
+    },
+  };
+
+  const server = createPluginContainer({}, [plugin], { environment: "ssr" });
+  const client = createPluginContainer({}, [plugin], { environment: "client" });
+
+  assert.equal(await server.transform("", "/page.mdx"), 'export default "server";');
+  assert.equal(await client.transform("", "/page.mdx"), 'export default "client";');
+});
+
+test("plugin container preserves an explicitly disabled Vite public directory", async () => {
+  const root = mkdtempSync(join(tmpdir(), "oj-no-public-"));
+  try {
+    const vite = join(root, "node_modules", "vite");
+    mkdirSync(vite, { recursive: true });
+    writeFileSync(join(root, "package.json"), '{"name":"synthetic-app"}');
+    writeFileSync(join(root, "vite.config.mjs"), "export default {};\n");
+    writeFileSync(join(vite, "package.json"), '{"name":"vite","type":"module","main":"./index.mjs"}');
+    writeFileSync(join(vite, "index.mjs"),
+      "export async function loadConfigFromFile() { return { config: { plugins: [], publicDir: false } }; }\n");
+
+    assert.equal((await loadPluginContainer(root)).publicDir, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("plugin hook contexts resolve virtual dependencies without reentering themselves", async () => {
+  let resolverCalls = 0;
+  const container = createPluginContainer({}, [
+    {
+      name: "synthetic-delegating-resolver",
+      async resolveId(source, importer) {
+        if (source !== "virtual:entry") return null;
+        resolverCalls++;
+        const resolved = await this.resolve(source, importer, { skipSelf: true });
+        return `${resolved.id}?wrapped`;
+      },
+    },
+    {
+      name: "synthetic-fallback-resolver",
+      resolveId(source) {
+        return source.startsWith("virtual:") ? `\0resolved:${source.slice(8)}` : null;
+      },
+    },
+    {
+      name: "synthetic-dependency-loader",
+      async load(id) {
+        if (id !== "\0resolved:entry?wrapped") return null;
+        const dependency = await this.resolve("virtual:dependency", id);
+        return `export default ${JSON.stringify(dependency.id)};`;
+      },
+    },
+  ]);
+
+  assert.equal(await container.resolveId("virtual:entry", "/app.ts"), "\0resolved:entry?wrapped");
+  assert.equal(resolverCalls, 1);
+  assert.equal(await container.load("\0resolved:entry?wrapped"), 'export default "\\u0000resolved:dependency";');
 });
