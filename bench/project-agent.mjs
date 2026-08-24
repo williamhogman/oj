@@ -412,7 +412,7 @@ function diagnose(result) {
   if (result.ok) return result;
   const output = result.output.replaceAll(/\u001b\[[0-9;]*m/g, "");
   const dependencies = new Set();
-  for (const match of output.matchAll(/(?:Could not resolve|Cannot find package|Cannot find module|Can't resolve|unresolved bare import)\s+["']([^"']+)["']/g)) {
+  for (const match of output.matchAll(/(?:Could not resolve(?: import)?|Cannot find package|Cannot find module|Can't resolve|unresolved bare import|failed to resolve import)\s+["']([^"']+)["']/gi)) {
     dependencies.add(match[1]);
   }
   const incompatible = output.includes("ERR_PACKAGE_PATH_NOT_EXPORTED");

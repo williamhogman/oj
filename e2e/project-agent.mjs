@@ -53,18 +53,44 @@ try {
   });
   assert.equal(missingPack.status, 0, `could not create missing-dependency archive: ${missingPack.stderr}`);
 
+  const rollupExecutable = path.join(temporary, "synthetic-rollup-oj");
+  fs.writeFileSync(rollupExecutable, "#!/usr/bin/env node\nconsole.error(process.env.OJ_SYNTHETIC_FAILURE);\nprocess.exit(1);\n", {
+    mode: 0o755,
+  });
   const missing = spawnSync(process.execPath, [
     path.join(root, "bench", "project-agent.mjs"),
     "--project", missingArchive,
     "--dependency-layer", layer,
     "--mode", "build",
+    "--oj", rollupExecutable,
     "--output-dir", missingOutput,
-  ], { cwd: root, encoding: "utf8" });
+  ], { cwd: root, encoding: "utf8", env: { ...process.env, OJ_SYNTHETIC_FAILURE: 'Error: Could not resolve "missing-agent-dependency"' } });
   assert.notEqual(missing.status, 0, "archives with missing dependencies must fail");
 
   const missingReport = JSON.parse(fs.readFileSync(path.join(missingOutput, "report.json"), "utf8"));
   assert.equal(missingReport.projects[0].checks.build.diagnostic.kind, "missing-dependency");
   assert.ok(missingReport.projects[0].checks.build.diagnostic.dependencies.includes("missing-agent-dependency"));
+
+  for (const [index, [message, dependency]] of [
+    ['[vite]: Rollup failed to resolve import "@synthetic/rollup-package" from "/synthetic/main.ts"', "@synthetic/rollup-package"],
+    ['[plugin:vite:import-analysis] Failed to resolve import "synthetic-vite-package" from "src/App.tsx"', "synthetic-vite-package"],
+    ['RollupError: Could not resolve import "synthetic-import-package" from "entry.ts"', "synthetic-import-package"],
+  ].entries()) {
+    const rollupOutput = path.join(temporary, `rollup-results-${index}`);
+    const rollup = spawnSync(process.execPath, [
+      path.join(root, "bench", "project-agent.mjs"),
+      "--project", archive,
+      "--dependency-layer", layer,
+      "--mode", "build",
+      "--oj", rollupExecutable,
+      "--output-dir", rollupOutput,
+    ], { cwd: root, encoding: "utf8", env: { ...process.env, OJ_SYNTHETIC_FAILURE: message } });
+    assert.notEqual(rollup.status, 0, "synthetic Rollup dependency failures must fail");
+    const rollupReport = JSON.parse(fs.readFileSync(path.join(rollupOutput, "report.json"), "utf8"));
+    const diagnostic = rollupReport.projects[0].checks.build.diagnostic;
+    assert.equal(diagnostic.kind, "missing-dependency", `expected missing-dependency classification for: ${message}`);
+    assert.deepEqual(diagnostic.dependencies, [dependency]);
+  }
 
   const unsafe = path.join(temporary, "unsafe.zip");
   fs.symlinkSync("/etc/passwd", path.join(project, "outside"));
